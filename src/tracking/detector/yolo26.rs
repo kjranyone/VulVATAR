@@ -68,6 +68,21 @@ pub(crate) struct Yolo26PoseInference {
     size: u32,
     /// Ready-made RTMPose-face sidecar chain (the only face backend).
     face_rtmt: Option<crate::tracking::face_rtmtface::FaceRtmpose>,
+    /// Run the face chain every Nth frame (default 2 = 15 Hz). The
+    /// sidecar roundtrip + the downstream 478-point face attach are the
+    /// two largest per-frame costs added by the face channel; at 15 Hz
+    /// expressions / head pose stay well above perceptual need while
+    /// the detector stage sheds the cost on the skipped frames (the
+    /// last result is republished in between). `VULVATAR_FACE_EVERY_N`
+    /// overrides (1 = every frame).
+    face_every_n: u64,
+    /// Last accepted face result, republished on skipped frames.
+    last_face: Option<(
+        Vec<crate::tracking::SourceExpression>,
+        f32,
+        Option<crate::tracking::FacePose>,
+        Vec<[f32; 3]>,
+    )>,
     face_selector: face::FaceSourceSelector,
     frame_timestamp_ms: Option<f64>,
     frame_dt: crate::tracking::metric_frame::FrameDtTracker,
@@ -148,6 +163,11 @@ impl Yolo26PoseInference {
             .unwrap_or(640);
 
         let mut load_warnings = Vec::new();
+        let face_every_n = std::env::var("VULVATAR_FACE_EVERY_N")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(2);
         // Face backend: the ready-made RTMPose-face sidecar is the only
         // path (the MediaPipe FaceMesh pair was removed on 2026-09-22;
         // the pre-removal A/B implementation lives in git history).
@@ -182,6 +202,8 @@ impl Yolo26PoseInference {
             output_name,
             size,
             face_rtmt,
+            face_every_n,
+            last_face: None,
             face_selector: face::FaceSourceSelector::default(),
             frame_timestamp_ms: None,
             frame_dt: crate::tracking::metric_frame::FrameDtTracker::default(),
@@ -329,27 +351,37 @@ impl Yolo26PoseInference {
         let mut mesh_conf = 0.0f32;
         let mut mesh_face_pose: Option<crate::tracking::FacePose> = None;
         let face_dbg = std::env::var_os("VULVATAR_FACE_DEBUG").is_some();
+        let face_due = self.face_every_n <= 1 || frame_index % self.face_every_n == 0;
         if let Some(face_rtmt) = self.face_rtmt.as_mut() {
             if face_dbg && frame_index % 30 == 0 {
                 let n_pts = joints.iter().take(5).filter(|j| j.score >= 0.3).count();
                 info!("face debug: body face pts >=0.3: {n_pts}/5");
             }
-            if let Some(bbox) = build_face_bbox_from_body(&joints, width, height) {
-                if face_dbg && frame_index % 30 == 0 {
-                    info!(
-                        "face debug: bbox ({:.0},{:.0},{:.0})",
-                        bbox.x, bbox.y, bbox.size
-                    );
+            let mut fresh = false;
+            if face_due {
+                if let Some(bbox) = build_face_bbox_from_body(&joints, width, height) {
+                    if face_dbg && frame_index % 30 == 0 {
+                        info!(
+                            "face debug: bbox ({:.0},{:.0},{:.0})",
+                            bbox.x, bbox.y, bbox.size
+                        );
+                    }
+                    if let Some(result) =
+                        face_rtmt.estimate(rgb_data, width, height, (bbox.x, bbox.y, bbox.size))
+                    {
+                        self.last_face = Some(result.clone());
+                        fresh = true;
+                    }
                 }
-                if let Some((exprs, conf, pose, mesh478)) =
-                    face_rtmt.estimate(rgb_data, width, height, (bbox.x, bbox.y, bbox.size))
-                {
-                    skeleton.expressions = exprs;
-                    skeleton.face_mesh_confidence = Some(conf);
-                    mesh_conf = conf;
-                    mesh_face_pose = pose;
+            }
+            if fresh || !face_due {
+                if let Some((exprs, conf, pose, mesh478)) = self.last_face.as_ref() {
+                    skeleton.expressions = exprs.clone();
+                    skeleton.face_mesh_confidence = Some(*conf);
+                    mesh_conf = *conf;
+                    mesh_face_pose = pose.clone();
                     if let Some(aux) = self.last_aux.as_mut() {
-                        aux.face_mesh = Some((mesh478, conf));
+                        aux.face_mesh = Some((mesh478.clone(), *conf));
                     }
                 }
             }

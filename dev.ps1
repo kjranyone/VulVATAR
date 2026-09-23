@@ -798,8 +798,14 @@ $commands = @(
     # There is no webcam path — no camera means the tracker idles.
     @{ Group = "Build & run (RealSense D435 depth)"; Label = "build (debug)";   Cmd = "Invoke-CargoRealsense -CargoArgs @('build')" },
     @{ Group = "Build & run (RealSense D435 depth)"; Label = "build (release)"; Cmd = "Invoke-CargoRealsense -CargoArgs @('build','--release')" },
-    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (debug)";     Cmd = 'Install-Models; $env:VULVATAR_FACE_SIDECAR_PYTHON = (Get-FaceSidecarPython); $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'')' },
-    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (release)";   Cmd = 'Install-Models; $env:VULVATAR_FACE_SIDECAR_PYTHON = (Get-FaceSidecarPython); $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'',''--release'')' },
+    # VULVATAR_AUTO_ITERATIONS=8: live the tracking pose moves at mm scale
+    # every frame, so the GPU cloth never qualifies as quiet and the
+    # 32-iteration ladder (the offline settle fix) would run at full cost
+    # every frame — that starved the render thread back to ~23 fps. 8
+    # iterations at damping 0.15 hold the drape while the body is tracked
+    # (offline static-settle quality still defaults to 32).
+    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (debug)";     Cmd = 'Install-Models; $env:VULVATAR_FACE_SIDECAR_PYTHON = (Get-FaceSidecarPython); $env:VULVATAR_AUTO_ITERATIONS = "8"; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'')' },
+    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (release)";   Cmd = 'Install-Models; $env:VULVATAR_FACE_SIDECAR_PYTHON = (Get-FaceSidecarPython); $env:VULVATAR_AUTO_ITERATIONS = "8"; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'',''--release'')' },
 
     @{ Group = "Camera & depth"; Label = "diagnose realsense (enumerate + stream test)"; Cmd = "Invoke-CargoRealsense -CargoArgs @('run','--bin','diagnose_realsense')" },
     @{ Group = "Camera & depth"; Label = "depth capture / calib data (RealSense D435)"; Cmd = "Start-DepthCapture" },
