@@ -12,7 +12,7 @@ VulVATAR は、**Intel RealSense D435** デプスカメラを用いて演者の�
 |---|---|---|
 | **OS** | **Windows 11 (64-bit, Version 21H2 / Build 22000 以降)** | Windows 11 の Media Foundation 仮想カメラ機能を使用するため、**Windows 10 以前では仮想カメラ機能が動作しません**。 |
 | **キャプチャカメラ** | **Intel RealSense D435 / D435i** | **必須**（通常の Web カメラではトラッキングできません）。**USB 3.0 ポートに直結**してください（USB 2.0 接続時は帯域不足エラーとなります）。 |
-| **GPU** | **DirectML / Vulkan 1.2+ 対応の独立 GPU** | NVIDIA GeForce RTX 2060 / AMD Radeon RX 5600 相当以上。<br>※RTMW3D-x ニューラルネットワーク推論を DirectML で高速実行します（CPU 推論時はフレームレートが低下します）。 |
+| **GPU** | **DirectML / Vulkan 1.2+ 対応の独立 GPU** | NVIDIA GeForce RTX 2060 / AMD Radeon RX 5600 相当以上。<br>※姿勢推定・表情・手検出のニューラルネットワーク推論を DirectML で高速実行します（CPU 推論時はフレームレートが低下します）。 |
 | **メモリ** | 8 GB 以上 (16 GB 推奨) | アプリケーションおよび推論モデルの展開用。 |
 | **音声デバイス** | マイク入力 | リップシンク（音声母音解析）用。 |
 

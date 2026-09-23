@@ -302,7 +302,7 @@ fn main() -> Result<(), String> {
         chains.len(),
     ));
     let mut ranked: Vec<(f32, String, f32, bool, f32, f32)> = Vec::new();
-    for (k, &(ci, ref name, radius, bc)) in chains.iter().enumerate() {
+    for (k, &(_, ref name, radius, bc)) in chains.iter().enumerate() {
         let nj = base[k].len();
         if nj == 0 {
             continue;
@@ -359,14 +359,13 @@ fn main() -> Result<(), String> {
         ));
     }
     // Input actuals for context.
-    let mut yaw_p2p = 0.0f32;
     let mut lo = f32::MAX;
     let mut hi = f32::MIN;
     for &(y, _) in applied.iter().skip(settle_frames) {
         lo = lo.min(y);
         hi = hi.max(y);
     }
-    yaw_p2p = hi - lo;
+    let yaw_p2p = hi - lo;
     report.push_str(&format!(
         "\ninput chest yaw p2p over noise phase: {yaw_p2p:.3} deg\n"
     ));

@@ -1539,7 +1539,7 @@ fn cpu_cloth_overlay_gates_independently() {
 /// `cloth_collide_cs` (same resolve formula, sentinel semantics).
 #[test]
 fn sdf_contact_projects_onto_isosurface_only_when_enabled() {
-    use crate::simulation::sdf::{SdfField, SdfGrid, SENTINEL};
+    use crate::simulation::sdf::{SdfField, SdfGrid};
 
     // Linear-ramp field: `v = 0.005·(x − 5) − 0.01` metres everywhere —
     // the cell at the origin holds −0.01 (inside the surface) and the

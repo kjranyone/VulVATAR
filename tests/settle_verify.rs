@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use vulvatar_lib::asset::{
-    identity_matrix, AssetSourceHash, AvatarAsset, AvatarAssetId, ColliderShape,
+    identity_matrix, AssetSourceHash, AvatarAsset, AvatarAssetId,
     ColliderShape as Shape, ExpressionAssetSet, NodeId, SceneColliderAsset, SceneColliderId,
     SkeletonAsset, SkeletonNode, SpringBoneAsset, Transform, Aabb,
 };
@@ -20,7 +20,7 @@ use vulvatar_lib::simulation::cloth::{
 use vulvatar_lib::simulation::cloth_gpu_boundary::ClothSolverBackend;
 use vulvatar_lib::simulation::cloth_solver;
 use vulvatar_lib::simulation::sdf::{SdfField, SdfGrid, SENTINEL};
-use vulvatar_lib::simulation::spring::{self, SpringTuning};
+use vulvatar_lib::simulation::spring::SpringTuning;
 use vulvatar_lib::simulation::{PhysicsWorld, SceneGravity};
 
 // ---------------------------------------------------------------------

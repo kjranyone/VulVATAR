@@ -1351,7 +1351,7 @@ mod tests {
     #[test]
     fn cloth_selfcol_resolve_formula_matches_cpu() {
         let mut rng_state = 42_424_242u64;
-        let mut lcg = |s: &mut u64| -> f32 {
+        let lcg = |s: &mut u64| -> f32 {
             *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
             ((*s >> 33) as f32 / (u32::MAX >> 1) as f32) - 1.0
         };

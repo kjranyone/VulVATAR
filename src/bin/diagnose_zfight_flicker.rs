@@ -159,7 +159,7 @@ fn main() -> Result<(), String> {
         if frame % 10 == 0 || frame == total_frames - 1 {
             let mut asleep = 0usize;
             let mut awake_sample: Vec<(String, f32)> = Vec::new();
-            for (ci, st) in avatar.secondary_motion.spring_states.iter().enumerate() {
+            for st in avatar.secondary_motion.spring_states.iter() {
                 if st.sleeping {
                     asleep += 1;
                 } else if awake_sample.len() < 24 {

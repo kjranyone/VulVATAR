@@ -29,7 +29,7 @@
 
 use std::path::PathBuf;
 
-use vulvatar_lib::asset::{ColliderShape, HumanoidBone, Mat4, SkeletonAsset, Transform, Vec3};
+use vulvatar_lib::asset::{ColliderShape, HumanoidBone, SkeletonAsset, Transform, Vec3};
 use vulvatar_lib::math_utils::{
     quat_conjugate, quat_mul, quat_normalize, quat_rotate_vec3, vec3_add, vec3_sub,
 };
@@ -708,14 +708,6 @@ fn lerp_locals(a: &[Transform], b: &[Transform], t: f32) -> Vec<Transform> {
 
 fn dot3(a: &[f32], b: &[f32]) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn transform_point(m: &Mat4, p: &Vec3) -> [f32; 3] {
-    [
-        m[0][0] * p[0] + m[1][0] * p[1] + m[2][0] * p[2] + m[3][0],
-        m[0][1] * p[0] + m[1][1] * p[1] + m[2][1] * p[2] + m[3][1],
-        m[0][2] * p[0] + m[1][2] * p[1] + m[2][2] * p[2] + m[3][2],
-    ]
 }
 
 /// M3: body-vs-skirt poke. Measures how far the posed BODY mesh sticks

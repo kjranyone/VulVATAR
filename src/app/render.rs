@@ -1528,6 +1528,7 @@ fn settle_quant(v: f32) -> f32 {
     (v * 2048.0).round()
 }
 
+#[cfg(test)]
 fn cloth_gpu_inputs_hash(
     ctrl_dt: f32,
     sim: &crate::simulation::cloth::ClothSimState,

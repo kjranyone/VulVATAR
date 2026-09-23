@@ -8,8 +8,6 @@ VulVATAR distributes or makes use of third-party software libraries, neural netw
 
 | Component | Provider / Author | License | Description / Artifact |
 |---|---|---|---|
-| **RTMW3D-x** | OpenMMLab / Soykaf | Apache-2.0 | Whole-body 3D pose estimation model (`models/rtmw3d.onnx`) |
-| **YOLOX-m** | Megvii / OpenMMLab | Apache-2.0 | Human-art tuned person detection model (`models/yolox.onnx`) |
 | **RTMPose-Face-WFLW (LiteRT)** | Google litert-community / OpenMMLab | Apache-2.0 | 98-point face landmark model for the face sidecar (`models/rtm_face_fp16.tflite`) |
 | **Material Symbols Rounded** | Google LLC | Apache-2.0 | Icon font (`assets/MaterialSymbolsRounded.ttf`) |
 | **Noto Sans CJK** (JP, KR, SC) | Google LLC / Adobe Systems | SIL OFL 1.1 | CJK UI fonts (`assets/NotoSans*.otf`) |
@@ -22,8 +20,6 @@ VulVATAR distributes or makes use of third-party software libraries, neural netw
 ## 1. Apache License, Version 2.0
 
 The following components are licensed under the Apache License, Version 2.0:
-- **RTMW3D-x** (Copyright (c) 2020-2024 OpenMMLab Authors, Soykaf)
-- **YOLOX-m** (Copyright (c) 2021-2022 Megvii Inc., OpenMMLab)
 - **RTMPose-Face-WFLW (LiteRT)** (Copyright 2024 Google LLC, litert-community; model trained by OpenMMLab, Apache-2.0)
 - **Material Symbols Rounded** (Copyright 2022 Google LLC)
 - **Intel RealSense SDK 2.0** (Copyright (c) 2017-2024 Intel Corporation)

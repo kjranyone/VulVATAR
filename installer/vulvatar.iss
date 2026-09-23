@@ -86,8 +86,6 @@ Source: "..\assets\NotoSansJP-Regular.otf";     DestDir: "{app}\assets";        
 Source: "..\assets\NotoSansKR-Regular.otf";     DestDir: "{app}\assets";         Flags: ignoreversion
 Source: "..\assets\NotoSansSC-Regular.otf";     DestDir: "{app}\assets";         Flags: ignoreversion
 Source: "..\assets\MaterialSymbolsRounded.ttf"; DestDir: "{app}\assets";         Flags: ignoreversion
-Source: "..\models\rtmw3d.onnx";                DestDir: "{app}\models";         Flags: ignoreversion
-Source: "..\models\yolox.onnx";                 DestDir: "{app}\models";         Flags: ignoreversion
 ; Default (RTMPose-face sidecar) face chain: landmark tflite, the
 ; canonical-mesh anchors, and the sidecar script. The MediaPipe
 ; face/hand ONNX bundles are no longer shipped (runtime removed

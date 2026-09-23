@@ -84,8 +84,6 @@ pub struct HandResult {
 pub struct RtmposeHand {
     session: Session,
     input_name: String,
-    /// Square model input side (from the `_NNN` filename convention).
-    size: u32,
     tensor: Array4<f32>,
     /// Optional distilled presence classifier; absent → presence falls
     /// back to the SimCC sharpness proxy (unreliable — see PresenceNet).
@@ -375,7 +373,6 @@ impl RtmposeHand {
         Ok(Some(Self {
             session,
             input_name,
-            size,
             tensor: Array4::<f32>::zeros((1, 3, size as usize, size as usize)),
             presence_net,
             palm_net,

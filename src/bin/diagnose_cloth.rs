@@ -9,7 +9,7 @@ use vulvatar_lib::asset::vrm::VrmAssetLoader;
 use vulvatar_lib::asset::{
     AvatarAsset, ClothAsset, ClothConstraintSet, ClothMappingMode, ClothMeshMapping,
     ClothOverlayId, ClothOverlayMetadata, ClothPin, ClothRegionTag, ClothRenderRegionBinding,
-    ClothSimVertex, ClothSimulationMesh, ClothSolverParams, ClothStableRefSet, DistanceConstraint,
+    ClothSimVertex, ClothSimulationMesh, ClothSolverParams, ClothStableRefSet,
     MeshId, MeshRef, NodeRef, PrimitiveId, PrimitiveRef, VertexSubsetRef,
 };
 use vulvatar_lib::avatar::{AvatarInstance, AvatarInstanceId};
@@ -581,7 +581,6 @@ fn main() -> Result<(), String> {
         if capture_frames.contains(&frame) {
             let frame_input = build_render_frame_input(
                 &avatar,
-                skirt_prim_id,
                 render_width,
                 render_height,
                 frame,
@@ -661,11 +660,9 @@ fn main() -> Result<(), String> {
                         "base pose",
                         &avatar,
                         pid,
-                        5,
                     );
-                    audit_clearance_anchors_with(&gen_skinning, "generation pose", &avatar, pid, 5);
+                    audit_clearance_anchors_with(&gen_skinning, "generation pose", &avatar, pid);
                 }
-                let _ = top_k_unused();
             }
 
             // R2 final-VBO audit (rows only when `VULVATAR_VBO_AUDIT=1`):
@@ -826,7 +823,6 @@ fn audit_clearance_anchors_with(
     label: &str,
     avatar: &AvatarInstance,
     prim_id: PrimitiveId,
-    top_k: usize,
 ) {
     let asset = &avatar.asset;
     let Some(prim) = asset
@@ -983,143 +979,6 @@ fn generation_pose_skinning(asset: &vulvatar_lib::asset::AvatarAsset) -> Vec<vul
     let mut skinning = vec![vulvatar_lib::asset::identity_matrix(); node_count];
     vulvatar_lib::avatar::pose::build_skinning_matrices(&asset.skeleton, &globals, &mut skinning);
     skinning
-}
-
-fn top_k_unused() {}
-
-fn audit_clearance_anchors(avatar: &AvatarInstance, prim_id: PrimitiveId, top_k: usize) {
-    let asset = &avatar.asset;
-    let Some(prim) = asset
-        .meshes
-        .iter()
-        .flat_map(|m| m.primitives.iter())
-        .find(|p| p.id == prim_id)
-    else {
-        return;
-    };
-    let Some(ref anchors) = prim.skin_anchors else {
-        return;
-    };
-    let Some(parent_id) = prim.body_primitive_id else {
-        return;
-    };
-    let Some(parent) = asset
-        .meshes
-        .iter()
-        .flat_map(|m| m.primitives.iter())
-        .find(|p| p.id == parent_id)
-    else {
-        println!("  ANCHORS prim {}: parent {:?} NOT FOUND", prim_id.0, parent_id);
-        return;
-    };
-    let skinning = &avatar.pose.skinning_matrices;
-
-    // Skinned positions through the CURRENT skinning matrices (LBS,
-    // 4-weight normalised — same recipe as `build_cloth_for_prim`).
-    let lbs_positions = |vd: &vulvatar_lib::asset::VertexData| -> Vec<[f32; 3]> {
-        vd.positions
-            .iter()
-            .enumerate()
-            .map(|(i, &pos)| {
-                let mut w = [0.0f32; 3];
-                let mut total = 0.0;
-                if i < vd.joint_weights.len() && i < vd.joint_indices.len() {
-                    for k in 0..4 {
-                        let wt = vd.joint_weights[i][k];
-                        if wt > 0.0001 {
-                            let j = vd.joint_indices[i][k] as usize;
-                            if let Some(m) = skinning.get(j) {
-                                for c in 0..3 {
-                                    w[c] += wt
-                                        * (m[0][c] * pos[0]
-                                            + m[1][c] * pos[1]
-                                            + m[2][c] * pos[2]
-                                            + m[3][c]);
-                                }
-                                total += wt;
-                            }
-                        }
-                    }
-                }
-                if total > 0.001 {
-                    for c in 0..3 {
-                        w[c] /= total;
-                    }
-                }
-                w
-            })
-            .collect()
-    };
-    let Some(parent_vd) = parent.vertices.as_ref() else {
-        return;
-    };
-    let parent_lbs: Vec<[f32; 3]> = lbs_positions(parent_vd);
-    let child_lbs: Option<Vec<[f32; 3]>> = prim.vertices.as_ref().map(|vd| lbs_positions(vd));
-
-    let mut rows: Vec<(f32, u32, f32, [f32; 3])> = Vec::new(); // (deficit, body_vertex_idx, weight, parent_pos)
-    for (vi, anc) in anchors.iter().enumerate() {
-        if anc.body_vertex_idx == 0xFFFFFFFF || anc.weight <= 1e-4 {
-            continue;
-        }
-        let Some(bp) = parent_lbs.get(anc.body_vertex_idx as usize) else {
-            continue;
-        };
-        let Some(child_pos) = child_lbs.as_ref().and_then(|l| l.get(vi)).copied() else {
-            continue;
-        };
-        // Parent rest normal — a locator approximation, valid for the
-        // small pose deltas this bin drives.
-        let bn = parent_vd
-            .normals
-            .get(anc.body_vertex_idx as usize)
-            .copied()
-            .unwrap_or([0.0, 1.0, 0.0]);
-        let nlen = (bn[0] * bn[0] + bn[1] * bn[1] + bn[2] * bn[2]).sqrt();
-        if nlen < 1e-4 {
-            continue;
-        }
-        let bn = [bn[0] / nlen, bn[1] / nlen, bn[2] / nlen];
-        let clearance = (child_pos[0] - bp[0]) * bn[0]
-            + (child_pos[1] - bp[1]) * bn[1]
-            + (child_pos[2] - bp[2]) * bn[2];
-        let deficit = anc.min_clearance - clearance;
-        rows.push((deficit, anc.body_vertex_idx, anc.weight, *bp));
-    }
-    if !rows.is_empty() {
-        let min_cl: Vec<f32> = anchors
-            .iter()
-            .filter(|a| a.body_vertex_idx != 0xFFFFFFFF && a.weight > 1e-4)
-            .map(|a| a.min_clearance)
-            .collect();
-        let mut mc = min_cl.clone();
-        mc.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        println!(
-            "    min_clearance: min {:.1} / median {:.1} / max {:.1} mm  ({} anchors)",
-            mc.first().copied().unwrap_or(0.0) * 1000.0,
-            mc[mc.len() / 2] * 1000.0,
-            mc.last().copied().unwrap_or(0.0) * 1000.0,
-            mc.len()
-        );
-    }
-    rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    println!(
-        "  ANCHORS prim {}: {} anchors vs parent {:?} ({} parent verts); worst deficits:",
-        prim_id.0,
-        anchors.len(),
-        parent_id,
-        parent_lbs.len()
-    );
-    for (deficit, bvi, weight, bp) in rows.iter().take(top_k) {
-        println!(
-            "    deficit {:>7.1} mm  parent_vert {:>5}  weight {:.2}  at [{:.2}, {:.2}, {:.2}]",
-            deficit * 1000.0,
-            bvi,
-            weight,
-            bp[0],
-            bp[1],
-            bp[2]
-        );
-    }
 }
 
 fn build_skirt_cloth_asset(
@@ -1503,7 +1362,6 @@ fn gpu_pin_targets(
 
 fn build_render_frame_input(
     avatar: &AvatarInstance,
-    skirt_prim_id: PrimitiveId,
     width: u32,
     height: u32,
     frame_idx: usize,

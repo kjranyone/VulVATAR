@@ -381,6 +381,10 @@ struct ClothGpuCollideResources {
 pub(super) struct ClothGpuBendResources {
     #[allow(dead_code)]
     bend_ssbo: Subbuffer<[pipeline::ClothBendGpu]>,
+    /// Not read on the host — held so the uniform buffer the descriptor
+    /// sets point at outlives them (same keep-alive contract as
+    /// `bend_ssbo`).
+    #[allow(dead_code)]
     control_ubo: Subbuffer<pipeline::ClothBendControl>,
     update_set: Arc<DescriptorSet>,
     accumulate_set: Arc<DescriptorSet>,

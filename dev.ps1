@@ -78,35 +78,22 @@ function Install-Font {
 }
 
 function Install-Models {
-    # Pulls RTMW3D-x for body / hands and YOLOX-m for human-art person
-    # detection (both kept only for legacy offline tooling — the runtime
-    # detector is YOLO26-pose, exported via the 'export yolo26-pose ONNX'
-    # menu entry), plus the RTMPose-Face-WFLW LiteRT model for the face
-    # sidecar.
+    # Downloads the RTMPose-Face-WFLW LiteRT model for the face sidecar
+    # and provisions its Python env. Everything else the runtime loads is
+    # produced locally: YOLO26-pose is exported from the repo's .pt via
+    # the 'export yolo26-pose ONNX' menu entry, and the RTMPose hand
+    # exports + face blendshape MLP are offline-distilled (cannot be
+    # downloaded — missing files are noted below).
     #
-    #   * RTMW3D-x   — Soykaf/RTMW3D-x              (370 MB, 133 3D landmarks)
-    #   * YOLOX-m    — mmpose rtmposev1 onnx_sdk    (94 MB,  human-art bbox)
-    #   * RTMPose-Face — litert-community WFLW98    (34 MB,  face sidecar)
-    #
-    # The MediaPipe FaceMesh / Blendshape / hand-landmarker downloads were
-    # removed with the MediaPipe runtime backends (hand 2026-09-18, face
-    # 2026-09-22). The offline face-distillation teacher models are no
-    # longer provisioned here — re-running scratchpad face-distill tooling
-    # fetches them manually (PINTO 410/390).
+    # The RTMW3D / YOLOX / MediaPipe model downloads were removed with the
+    # backends that consumed them (RTMW3D + YOLOX: YOLO26 migration;
+    # MediaPipe: hand 2026-09-18, face 2026-09-22). Offline tooling that
+    # still wants them (e.g. the face-distillation teacher, PINTO 410/390)
+    # fetches them manually.
     Write-Host "Setting up VulVATAR ONNX models..." -ForegroundColor Cyan
     if (!(Test-Path "models")) {
         New-Item -ItemType Directory -Force -Path "models" | Out-Null
     }
-
-    Install-DirectFiles -Name "RTMW3D-x whole-body 3D pose" -Files @(
-        @{ Url = "https://huggingface.co/Soykaf/RTMW3D-x/resolve/main/onnx/rtmw3d-x_8xb64_cocktail14-384x288-b0a0eab7_20240626.onnx";
-           OutName = "rtmw3d.onnx" }
-    )
-
-    Install-ZipArchive -Name "YOLOX-m human-art person detector" `
-        -ArchiveUrl "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/yolox_m_8xb8-300e_humanart-c2c7a14a.zip" `
-        -KeepGlobs @("end2end.onnx") `
-        -RenameMap @{ "end2end.onnx" = "yolox.onnx" }
 
     # Face mesh + blendshape from PINTO_model_zoo were removed with the
     # MediaPipe face backend (2026-09-22); the RTMPose-face sidecar below
@@ -152,93 +139,6 @@ function Install-Models {
 
     Write-Host "VulVATAR ONNX models installed successfully." -ForegroundColor Green
 }
-
-# Download a `.zip` archive, extract to a temp dir, copy ONNX files
-# matching `KeepGlobs` into `models\`, optionally renaming via
-# `RenameMap`, and remove the temp dir. Used for OpenMMLab mmdeploy
-# bundles that ship as zip rather than tar.gz.
-function Install-ZipArchive {
-    param(
-        [Parameter(Mandatory)] [string]$Name,
-        [Parameter(Mandatory)] [string]$ArchiveUrl,
-        [Parameter(Mandatory)] [string[]]$KeepGlobs,
-        [hashtable]$RenameMap = @{}
-    )
-
-    # Resolve the post-rename target file name for each glob and skip
-    # the download if every target is already present.
-    $allPresent = $true
-    foreach ($glob in $KeepGlobs) {
-        $finalName = if ($RenameMap.ContainsKey($glob)) { $RenameMap[$glob] } else { $glob }
-        if (-not (Test-Path "models\$finalName")) {
-            $allPresent = $false
-            break
-        }
-    }
-    if ($allPresent) {
-        Write-Host "  ${Name}: already installed, skipping" -ForegroundColor Green
-        return
-    }
-
-    Write-Host "  Fetching ${Name}..." -ForegroundColor Cyan
-    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("vulvatar_models_" + [guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
-    try {
-        $archivePath = Join-Path $tempDir "archive.zip"
-        Write-Host "    downloading $ArchiveUrl" -ForegroundColor DarkGray
-        & curl.exe --fail --silent --show-error --location $ArchiveUrl -o $archivePath
-        if ($LASTEXITCODE -ne 0) {
-            throw "curl download failed for $Name (exit $LASTEXITCODE): $ArchiveUrl"
-        }
-
-        Write-Host "    extracting..." -ForegroundColor DarkGray
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($archivePath, $tempDir)
-
-        $copied = 0
-        foreach ($glob in $KeepGlobs) {
-            $matched = Get-ChildItem -Path $tempDir -Recurse -Filter $glob -File
-            foreach ($file in $matched) {
-                $finalName = if ($RenameMap.ContainsKey($glob)) { $RenameMap[$glob] } else { $file.Name }
-                $dest = Join-Path "models" $finalName
-                Copy-Item -Path $file.FullName -Destination $dest -Force
-                Write-Host "    kept $finalName" -ForegroundColor Green
-                $copied++
-            }
-        }
-        if ($copied -eq 0) {
-            throw "$Name archive contained no files matching: $($KeepGlobs -join ', ')"
-        }
-    } finally {
-        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-
-# Download individual .onnx files directly. Used for sources that
-# publish pre-built ONNX as release assets (no archive unpacking).
-function Install-DirectFiles {
-    param(
-        [Parameter(Mandatory)] [string]$Name,
-        [Parameter(Mandatory)] [array]$Files
-    )
-
-    Write-Host "  Fetching ${Name}..." -ForegroundColor Cyan
-    foreach ($f in $Files) {
-        $dest = Join-Path "models" $f.OutName
-        if (Test-Path $dest) {
-            Write-Host "    $($f.OutName): already installed, skipping" -ForegroundColor Green
-            continue
-        }
-        Write-Host "    downloading $($f.Url)" -ForegroundColor DarkGray
-        & curl.exe --fail --silent --show-error --location $f.Url -o $dest
-        if ($LASTEXITCODE -ne 0) {
-            throw "curl download failed for $($f.OutName) (exit $LASTEXITCODE): $($f.Url)"
-        }
-        Write-Host "    kept $($f.OutName)" -ForegroundColor Green
-    }
-}
-
-#endregion
 
 #region Face sidecar & YOLO26 export
 # Interpreter path of the face-sidecar venv. Install-FaceSidecarEnv
@@ -635,8 +535,6 @@ function Test-DistributionPrereqs {
         "assets\NotoSansKR-Regular.otf",
         "assets\NotoSansSC-Regular.otf",
         "assets\MaterialSymbolsRounded.ttf",
-        "models\rtmw3d.onnx",
-        "models\yolox.onnx",
         # Default (RTMPose-face sidecar) face chain: landmark tflite +
         # canonical-mesh anchors + the sidecar script itself. The MediaPipe
         # face/hand ONNX bundles are no longer shipped (runtime removed

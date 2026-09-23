@@ -77,7 +77,6 @@ fn main() -> Result<(), String> {
         let vd = skirt.vertices.as_ref().unwrap();
         let mut lo = [f32::MAX; 3];
         let mut hi = [f32::MIN; 3];
-        let mut flyers = 0usize;
         let mut max_disp: f32 = 0.0;
         for (i, &pos) in vd.positions.iter().enumerate() {
             let mut world = [0.0f32; 3];
@@ -114,9 +113,6 @@ fn main() -> Result<(), String> {
                 + (world[1] - pos[1]).powi(2)
                 + (world[2] - pos[2]).powi(2);
             max_disp = max_disp.max(disp.sqrt());
-            if disp.sqrt() > 0.02 {
-                flyers += 1;
-            }
             for c in 0..3 {
                 lo[c] = lo[c].min(world[c]);
                 hi[c] = hi[c].max(world[c]);
@@ -1224,7 +1220,7 @@ body_sdf: None,
     {
         let attached = vulvatar_lib::simulation::auto_cloth::attach_auto_cloth(&mut avatar);
         println!("auto-cloth attached: {attached}");
-        let mut mesh_instances2 = frame_input2.instances[0].mesh_instances.clone();
+        let mesh_instances2 = frame_input2.instances[0].mesh_instances.clone();
         for fidx in 0..12usize {
             avatar.build_base_pose();
             avatar.compute_global_pose();

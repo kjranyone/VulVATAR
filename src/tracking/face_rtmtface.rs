@@ -38,6 +38,9 @@ use crate::tracking::{FacePose, SourceExpression};
 
 const CROP: usize = 256;
 const K: usize = 98;
+/// Consecutive sidecar failures (spawn or roundtrip) before the chain
+/// latches off for the session instead of respawning at frame rate.
+const MAX_FAIL_ROUNDS: u32 = 3;
 /// WFLW98 slot ranges (mean-template verified): eye rings, mouth rings,
 /// pupils. EAR/MAR use bounding-box ratios so the ring point ORDER does
 /// not matter.
@@ -279,8 +282,25 @@ impl FaceRtmpose {
     }
 
     fn roundtrip(&mut self, crop: &[u8]) -> Option<Vec<[f32; 2]>> {
+        // Latch: a dead sidecar (missing litert / python / script) fails
+        // deterministically, so after MAX_FAIL_ROUNDS stop respawning —
+        // the alternative is a respawn + error log at frame rate for the
+        // rest of the session. Tracking restart re-arms.
+        if self.fail_run >= MAX_FAIL_ROUNDS {
+            return None;
+        }
         if self.child.is_none() {
-            self.spawn().ok()?;
+            if let Err(e) = self.spawn() {
+                self.fail_run += 1;
+                if self.fail_run >= MAX_FAIL_ROUNDS {
+                    error!(
+                        "face sidecar failed to start {} rounds in a row ({e}) — \
+                         expressions disabled for this session",
+                        self.fail_run
+                    );
+                }
+                return None;
+            }
         }
         let payload = (crop.len() as u32).to_le_bytes();
         let send = |child: &mut Child| -> Option<()> {
@@ -321,8 +341,12 @@ impl FaceRtmpose {
             let _ = child.wait();
         }
         self.child = None;
-        if self.fail_run >= 3 {
-            error!("face sidecar failed {} rounds in a row", self.fail_run);
+        if self.fail_run >= MAX_FAIL_ROUNDS {
+            error!(
+                "face sidecar failed {} rounds in a row — expressions disabled \
+                 for this session (tracking restart re-arms)",
+                self.fail_run
+            );
             return None;
         }
         self.spawn().ok()?;
@@ -451,10 +475,6 @@ impl FaceRtmpose {
                         if let Ok((_, data)) = o.try_extract_tensor::<f32>() {
                             let sigmoid = |v: f32| 1.0 / (1.0 + (-v).exp());
                             for (i, name) in FACE_BLENDSHAPE_NAMES.iter().enumerate().skip(1) {
-                                let geo = exprs
-                                    .iter()
-                                    .find(|e| e.name == *name)
-                                    .map(|e| e.weight);
                                 let v = sigmoid(data[i]).clamp(0.0, 1.0);
                                 // geometric rule wins when more extreme
                                 // (a detected blink must not be washed

@@ -391,11 +391,6 @@ fn hand_side(bone: &HumanoidBone) -> Option<usize> {
     }
 }
 
-fn smoothstep01(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
 /// Rotation angle (rad) between two quaternions, hemisphere-agnostic.
 fn quat_angle_between(a: [f32; 4], b: [f32; 4]) -> f32 {
     let mut d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
