@@ -425,7 +425,14 @@ fn build_cloth_for_prim(
         collision_bindings: Vec::new(),
         lods: Vec::new(),
         solver_params: ClothSolverParams {
-            substeps: 4,
+            // 60 Hz halves the per-frame dt, so fewer substeps hold the
+            // same integration stability per second — the dispatch cost
+            // of the whole GPU chain scales with this count.
+            substeps: std::env::var("VULVATAR_AUTO_SUBSTEPS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or(4),
             iterations: std::env::var("VULVATAR_AUTO_ITERATIONS")
                 .ok()
                 .and_then(|v| v.parse().ok())
