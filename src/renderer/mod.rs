@@ -1333,6 +1333,30 @@ impl VulkanRenderer {
         let extent = self.current_extent;
 
         if self.frame_counter.is_multiple_of(60) {
+            // The CB was flushed above but not waited — reading query
+            // results while the GPU is still executing this very frame
+            // wedged the render thread permanently on the Arc driver
+            // (observed: seq frozen at the first %60 frame). Wait the
+            // frame fence first so every query is complete; once per
+            // second is fine for on-demand profiling.
+            if let Err(e) = fence_future.wait(Some(std::time::Duration::from_millis(500))) {
+                println!("RENDER_PROF frame fence wait failed: {e:?}");
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("profile/render_prof.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(
+                    f,
+                    "tick frame={} even={} cb_hits={} cb_misses={}",
+                    self.frame_counter,
+                    self.frame_counter % 2 == 0,
+                    self.gpu_runtime_counters.cb_cache_hits,
+                    self.gpu_runtime_counters.cb_cache_misses
+                );
+            }
             let counters = &self.gpu_runtime_counters;
             info!(
                 "GPU_RUNTIME frame={} transform_resources={} weight_writes={} \
@@ -1355,7 +1379,11 @@ impl VulkanRenderer {
                 // any unwritten query and would stall the render thread
                 // forever (observed as a driver device-lost on first use).
                 let mut ticks = [0u64; 9];
-                match pool.get_results(0..9, &mut ticks, vulkano::query::QueryResultFlags::WAIT) {
+                match pool.get_results(
+                    0..9,
+                    &mut ticks,
+                    vulkano::query::QueryResultFlags::empty(),
+                ) {
                     Ok(_) => {
                         // Timestamps carry the queue family's valid bits in
                         // the low word; mask to 32 bits (wraps ≈ 100 s at
@@ -1367,19 +1395,30 @@ impl VulkanRenderer {
                         let total = ms(ticks[0], ticks[4]);
                         let cloth = ms(ticks[5], ticks[6]);
                         let sdf = ms(ticks[7], ticks[8]);
-                        println!(
-                            "RENDER_PROF compute_prepass={:.2}ms scene={:.2}ms post={:.2}ms readback_copy={:.2}ms total={:.2}ms | clothsim={:.2}ms sdf_splat={:.2}ms rest={:.2}ms (iters=env)",
-                            ms(ticks[0], ticks[1]),
-                            ms(ticks[1], ticks[2]),
-                            ms(ticks[2], ticks[3]),
-                            ms(ticks[3], ticks[4]),
-                            total,
-                            cloth,
-                            sdf,
-                            (total - cloth - sdf).max(0.0),
-                        );
+                        // stdout is unreliable behind the dev.ps1
+                        // launcher — append to profile/ (gitignored) so
+                        // the breakdown survives the session.
+                        if let Ok(mut f) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("profile/render_prof.log")
+                        {
+                            use std::io::Write;
+                            let _ = writeln!(
+                                f,
+                                "RENDER_PROF compute_prepass={:.2}ms scene={:.2}ms post={:.2}ms readback_copy={:.2}ms total={:.2}ms | clothsim={:.2}ms sdf_splat={:.2}ms rest={:.2}ms (iters=env)",
+                                ms(ticks[0], ticks[1]),
+                                ms(ticks[1], ticks[2]),
+                                ms(ticks[2], ticks[3]),
+                                ms(ticks[3], ticks[4]),
+                                total,
+                                cloth,
+                                sdf,
+                                (total - cloth - sdf).max(0.0),
+                            );
+                        }
                     }
-                    Err(e) => println!("RENDER_PROF get_results failed: {e:?}"),
+                    Err(e) => println!("RENDER_PROF get_results failed: {e:?}"),  // kept on stdout (rare)
                 }
             }
         }
