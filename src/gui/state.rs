@@ -463,7 +463,7 @@ impl Default for TrackingGuiState {
         Self {
             toggle_tracking: true,
             camera_resolution_index: 0,
-            camera_framerate_index: 0,
+            camera_framerate_index: 1,
             tracking_mirror: true,
             hand_tracking_enabled: false,
             face_tracking_enabled: true,
