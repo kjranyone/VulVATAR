@@ -328,8 +328,19 @@ impl Yolo26PoseInference {
         // Face cascade: bbox from the five body-frame face points.
         let mut mesh_conf = 0.0f32;
         let mut mesh_face_pose: Option<crate::tracking::FacePose> = None;
+        let face_dbg = std::env::var_os("VULVATAR_FACE_DEBUG").is_some();
         if let Some(face_rtmt) = self.face_rtmt.as_mut() {
+            if face_dbg && frame_index % 30 == 0 {
+                let n_pts = joints.iter().take(5).filter(|j| j.score >= 0.3).count();
+                info!("face debug: body face pts >=0.3: {n_pts}/5");
+            }
             if let Some(bbox) = build_face_bbox_from_body(&joints, width, height) {
+                if face_dbg && frame_index % 30 == 0 {
+                    info!(
+                        "face debug: bbox ({:.0},{:.0},{:.0})",
+                        bbox.x, bbox.y, bbox.size
+                    );
+                }
                 if let Some((exprs, conf, pose, mesh478)) =
                     face_rtmt.estimate(rgb_data, width, height, (bbox.x, bbox.y, bbox.size))
                 {

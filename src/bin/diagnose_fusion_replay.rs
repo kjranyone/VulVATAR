@@ -440,6 +440,11 @@ fn main() -> Result<(), String> {
     let mut prev_rig_wrist: [Option<[f32; 3]>; 2] = [None, None];
     let mut rig_rot_jumps: Vec<f64> = Vec::new();
     let mut rig_wrist_jumps: Vec<f64> = Vec::new();
+    // Per-frame expression channels for the event-level calibration gate
+    // (deliberate blink / mouth recordings): blink and jaw are the
+    // geometric channels the face chain drives directly.
+    let mut expr_csv = String::from("idx,t,eyeBlinkLeft,eyeBlinkRight,jawOpen,n_exprs
+");
 
     for (n, (idx, cp, dp)) in pairs.iter().enumerate() {
         let (rgb, mut metric) = load_metric_frame(cp, dp)?;
@@ -449,6 +454,26 @@ fn main() -> Result<(), String> {
         let depth_pts = metric.points_m.clone();
         provider.set_external_depth(metric);
         let est_out = provider.estimate_pose(rgb.as_raw(), cw, ch, n as u64);
+        {
+            let exprs = &est_out.skeleton.expressions;
+            let get = |name: &str| -> f32 {
+                exprs
+                    .iter()
+                    .find(|e| e.name == name)
+                    .map(|e| e.weight)
+                    .unwrap_or(f32::NAN)
+            };
+            expr_csv.push_str(&format!(
+                "{},{:.1},{:.3},{:.3},{:.3},{}
+",
+                idx,
+                *idx as f64 / 30.0,
+                get("eyeBlinkLeft"),
+                get("eyeBlinkRight"),
+                get("jawOpen"),
+                exprs.len(),
+            ));
+        }
         let rig = est_out.skeleton.rig.clone();
         if let Some(r) = rig.as_ref() {
             let mut worst = 0.0f64;
@@ -1396,6 +1421,7 @@ fn main() -> Result<(), String> {
         }
     }
     std::fs::write(out_dir.join("frames.csv"), csv).map_err(|e| e.to_string())?;
+    std::fs::write(out_dir.join("expressions.csv"), expr_csv).map_err(|e| e.to_string())?;
     {
         let mut s = String::from("idx,finger_churn_deg\n");
         let valid: Vec<f64> = fing_churn.iter().copied().filter(|v| v.is_finite()).collect();

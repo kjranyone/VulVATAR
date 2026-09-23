@@ -67,8 +67,8 @@ pub struct FaceRtmpose {
     /// trained offline on MP blendshape labels) — supplies the channels
     /// the geometric rules do not cover (gaze, brows, lip detail)
     blend: Option<ort::session::Session>,
-    /// slow EAR baselines per eye ring (image-left, image-right)
-    ear_base: [f32; 2],
+    /// slow EAR baselines (image-left eye, image-right eye, mouth)
+    ear_base: [f32; 3],
     /// blink latch per eye ring
     blink_latched: [bool; 2],
     fail_run: u32,
@@ -83,10 +83,13 @@ struct Sim {
 
 impl Sim {
     fn apply(&self, p: [f64; 2]) -> [f64; 2] {
-        // px @ (r^T * scale) + t   (row-vector forward, numpy mirror)
+        // out = scale * r @ p + t (numpy mirror: r = vt^T @ u^T applied
+        // non-transposed; the transposed form rotated by -theta and was
+        // masked while svd2 returned V as u — r was symmetric identity
+        // then, so both bugs cancelled into "no rotation at all")
         [
-            self.scale * (p[0] * self.r[0][0] + p[1] * self.r[1][0]) + self.t[0],
-            self.scale * (p[0] * self.r[0][1] + p[1] * self.r[1][1]) + self.t[1],
+            self.scale * (self.r[0][0] * p[0] + self.r[0][1] * p[1]) + self.t[0],
+            self.scale * (self.r[1][0] * p[0] + self.r[1][1] * p[1]) + self.t[1],
         ]
     }
 }
@@ -105,12 +108,14 @@ fn sim_solve(a: &[[f64; 2]], b: &[[f64; 2]]) -> Option<Sim> {
         }
     }
     let (u, _, vt) = svd2(cov);
-    // r = vt^T @ u^T
+    // r = vt^T @ u^T, i.e. r[i][j] = Σ_k vt[k][i] * u[j][k] (numpy:
+    // R = Vt.T @ U.T). The former vt^T @ u form applied the wrong
+    // transpose of u.
     let mut r = [
-        [vt[0][0] * u[0][0] + vt[1][0] * u[1][0],
-         vt[0][1] * u[0][0] + vt[1][1] * u[1][0]],
-        [vt[0][0] * u[0][1] + vt[1][0] * u[1][1],
-         vt[0][1] * u[0][1] + vt[1][1] * u[1][1]],
+        [vt[0][0] * u[0][0] + vt[1][0] * u[0][1],
+         vt[0][0] * u[1][0] + vt[1][0] * u[1][1]],
+        [vt[0][1] * u[0][0] + vt[1][1] * u[0][1],
+         vt[0][1] * u[1][0] + vt[1][1] * u[1][1]],
     ];
     if r[0][0] * r[1][1] - r[0][1] * r[1][0] < 0.0 {
         // reflection: negate the LAST ROW of vt and rebuild
@@ -135,8 +140,8 @@ fn sim_solve(a: &[[f64; 2]], b: &[[f64; 2]]) -> Option<Sim> {
     }
     let scale = (num / den).sqrt();
     let t = [
-        mu_b[0] - scale * (r[0][0] * mu_a[0] + r[1][0] * mu_a[1]),
-        mu_b[1] - scale * (r[0][1] * mu_a[0] + r[1][1] * mu_a[1]),
+        mu_b[0] - scale * (r[0][0] * mu_a[0] + r[0][1] * mu_a[1]),
+        mu_b[1] - scale * (r[1][0] * mu_a[0] + r[1][1] * mu_a[1]),
     ];
     Some(Sim { scale, r, t })
 }
@@ -150,6 +155,13 @@ fn mean2(v: &[[f64; 2]]) -> [f64; 2] {
 }
 
 /// 2x2 SVD: returns u (2x2), singular values (2), v^T (2x2).
+///
+/// V comes from the symmetric eigen of m^T m; U = m V Σ⁺ (the singular
+/// vectors actually scaled by m) — NOT V itself. Feeding V as U made
+/// r = V V^T = identity, so the Procrustes fit degenerated to
+/// scale + translation with no rotation (measured: residual ~82 px on a
+/// ~20°-yawed face vs ~11 px with a proper rotation; the > 60 px
+/// rejection then dropped every frame and the face chain never fired).
 fn svd2(m: [[f64; 2]; 2]) -> ([[f64; 2]; 2], [f64; 2], [[f64; 2]; 2]) {
     // symmetric eigen of m^T m
     let mtm = [
@@ -176,8 +188,19 @@ fn svd2(m: [[f64; 2]; 2]) -> ([[f64; 2]; 2], [f64; 2], [[f64; 2]; 2]) {
     let n1 = (v1[0] * v1[0] + v1[1] * v1[1]).sqrt().max(1e-12);
     let v1 = [v1[0] / n1, v1[1] / n1];
     let v2 = [-v1[1], v1[0]];
-    let u = [[v1[0], v2[0]], [v1[1], v2[1]]];
     let vt = [[v1[0], v1[1]], [v2[0], v2[1]]];
+    // U = m V Σ⁺, one singular vector at a time; rank-deficient axes get
+    // the orthogonal complement of the previous column.
+    let mut u = [[0.0f64; 2]; 2];
+    for (k, (&sv, v)) in s.iter().zip([v1, v2].iter()).enumerate() {
+        if sv > 1e-12 {
+            u[0][k] = (m[0][0] * v[0] + m[0][1] * v[1]) / sv;
+            u[1][k] = (m[1][0] * v[0] + m[1][1] * v[1]) / sv;
+        } else {
+            u[0][k] = -u[1][0];
+            u[1][k] = u[0][0];
+        }
+    }
     (u, s, vt)
 }
 
@@ -256,7 +279,7 @@ impl FaceRtmpose {
             canonical,
             wflw_to_mp478,
             blend,
-            ear_base: [f32::NAN; 2],
+            ear_base: [f32::NAN; 3],
             blink_latched: [false; 2],
             fail_run: 0,
         })
@@ -367,6 +390,9 @@ impl FaceRtmpose {
     ) -> Option<(Vec<SourceExpression>, f32, Option<FacePose>, Vec<[f32; 3]>)> {
         let (bx, by, size) = bbox;
         if size < 40.0 {
+            if std::env::var_os("VULVATAR_FACE_DEBUG").is_some() {
+                info!("face debug: bbox too small ({size:.0})");
+            }
             return None;
         }
         // zero-padded 256 crop, same geometry as crop_face_to_tensor
@@ -391,11 +417,17 @@ impl FaceRtmpose {
                 }
             }
         }
-        let pts_norm = self.roundtrip(&crop)?;
+        let face_dbg = std::env::var_os("VULVATAR_FACE_DEBUG").is_some();
+        let Some(pts_norm) = self.roundtrip(&crop) else {
+            if face_dbg {
+                info!("face debug: roundtrip returned None");
+            }
+            return None;
+        };
         // crop-px coordinates
         let pts: Vec<[f64; 2]> = pts_norm
             .iter()
-            .map(|p| [f64::from(p[0]) * f64::from(CROP as u8), f64::from(p[1]) * f64::from(CROP as u8)])
+            .map(|p| [f64::from(p[0]) * CROP as f64, f64::from(p[1]) * CROP as f64])
             .collect();
 
         // Procrustes the canonical mesh's 98 anchor slots onto the
@@ -405,7 +437,12 @@ impl FaceRtmpose {
             .iter()
             .map(|&mi| [f64::from(self.canonical[mi][0]), f64::from(self.canonical[mi][1])])
             .collect();
-        let sim = sim_solve(&anchors_canon, &pts)?;
+        let Some(sim) = sim_solve(&anchors_canon, &pts) else {
+            if face_dbg {
+                info!("face debug: sim_solve degenerate");
+            }
+            return None;
+        };
 
         let residual = {
             let sum: f64 = anchors_canon
@@ -419,6 +456,19 @@ impl FaceRtmpose {
             let n = anchors_canon.len() as f64;
             (sum / n).sqrt()
         };
+        if face_dbg {
+            info!(
+                "face debug: residual {residual:.1} px (thr 60), sidecar span x [{:.0},{:.0}] y [{:.0},{:.0}], canon span x [{:.0},{:.0}] y [{:.0},{:.0}]",
+                pts.iter().map(|p| p[0]).fold(f64::MAX, f64::min),
+                pts.iter().map(|p| p[0]).fold(f64::MIN, f64::max),
+                pts.iter().map(|p| p[1]).fold(f64::MAX, f64::min),
+                pts.iter().map(|p| p[1]).fold(f64::MIN, f64::max),
+                anchors_canon.iter().map(|p| p[0]).fold(f64::MAX, f64::min),
+                anchors_canon.iter().map(|p| p[0]).fold(f64::MIN, f64::max),
+                anchors_canon.iter().map(|p| p[1]).fold(f64::MAX, f64::min),
+                anchors_canon.iter().map(|p| p[1]).fold(f64::MIN, f64::max),
+            );
+        }
         if residual > 60.0 {
             // the fit blew up: the face is not where the anchors claim
             return None;
@@ -432,10 +482,8 @@ impl FaceRtmpose {
             let c = [f64::from(slot[0]), f64::from(slot[1])];
             let q = sim.apply(c);
             mesh478[mi] = [
-                (q[0] / f64::from(CROP as u8) * f64::from(size as u8) as f64
-                    + f64::from(bbox.0)) as f32,
-                (q[1] / f64::from(CROP as u8) * f64::from(size as u8) as f64
-                    + f64::from(bbox.1)) as f32,
+                (q[0] / CROP as f64 * size as f64 + f64::from(bbox.0)) as f32,
+                (q[1] / CROP as f64 * size as f64 + f64::from(bbox.1)) as f32,
                 slot[2] / (CROP as f32) * (size as f32),
             ];
         }
@@ -498,11 +546,14 @@ impl FaceRtmpose {
 
     fn ring_ratio(&mut self, pts: &[[f64; 2]], ring: (usize, usize), eye: usize) -> f32 {
         let seg = &pts[ring.0..ring.1];
+        // min via fold(.., f64::min) — the former f64::max fold made
+        // w = max − f64::MAX (a huge negative), every ratio went
+        // negative and the [0,1] clamp zeroed every expression channel.
         let w = (seg.iter().map(|p| p[0]).fold(f64::MIN, f64::max)
-            - seg.iter().map(|p| p[0]).fold(f64::MAX, f64::max))
+            - seg.iter().map(|p| p[0]).fold(f64::MAX, f64::min))
         .max(1.0);
         let h = seg.iter().map(|p| p[1]).fold(f64::MIN, f64::max)
-            - seg.iter().map(|p| p[1]).fold(f64::MAX, f64::max);
+            - seg.iter().map(|p| p[1]).fold(f64::MAX, f64::min);
         let ratio = (h / w) as f32;
         // adaptive baseline (running median proxy: slow EMA)
         let base = &mut self.ear_base[eye];
@@ -516,6 +567,11 @@ impl FaceRtmpose {
     fn geometric_expressions(&mut self, pts: &[[f64; 2]]) -> Vec<SourceExpression> {
         // EAR ratio-to-baseline per ring; hysteresis blink latch. The
         // WFLW rings: 60..68 = image-left eye, 68..76 = image-right.
+        // ARKit semantics: 0 = open, 1 = closed — the raw ratio reads
+        // the opposite way (≈1 at rest), so map closedness through the
+        // latch threshold instead of publishing the ratio itself (the
+        // former raw-ratio channels sat at 1.0 rest / 0.5 blink, fully
+        // inverted).
         let mut ear = [0.0f32; 2];
         for (eye, ring) in (0..2).zip([EYE_A, EYE_B]) {
             ear[eye] = self.ring_ratio(pts, ring, eye);
@@ -530,21 +586,27 @@ impl FaceRtmpose {
                 self.blink_latched[eye] = true;
             }
         }
-        // MAR: mouth ring height / width, normalised by its own slow
-        // median the same way.
-        let mouth_ratio = self.ring_ratio(pts, MOUTH, 0);
-        let mouth_base = self.ear_base.get(0).copied().unwrap_or(1.0);
-        let _ = mouth_base;
-        let jaw = (mouth_ratio / 1.0).clamp(0.0, 1.0);
+        let closedness = |r: f32, latched: bool| -> f32 {
+            let c = ((1.0 - r) / (1.0 - BLINK_ENTER)).clamp(0.0, 1.0);
+            if latched { 1.0 } else { c }
+        };
+        // Mouth ring gets its OWN baseline slot — routing it through an
+        // eye slot let the mouth's much larger ratio corrupt that eye's
+        // baseline. jawOpen: rest ratio ≈ baseline → 0; opening raises
+        // the ring's h/w well above it.
+        let mar = self.ring_ratio(pts, MOUTH, 2);
+        let jaw = ((mar - 1.0) / 0.8).clamp(0.0, 1.0);
+        let blink_l = closedness(ear[0], self.blink_latched[0]);
+        let blink_r = closedness(ear[1], self.blink_latched[1]);
         let mut out = Vec::with_capacity(8);
         // ARKit names (subject-left ring is the image-RIGHT ring on an
         // unmirrored camera; WFLW 60..68 sits on the image left, which
         // the MP path's mirror convention assigns to subject LEFT).
-        out.push(expr("eyeBlinkLeft", ear[0]));
-        out.push(expr("eyeBlinkRight", ear[1]));
-        out.push(expr("blinkLeft", ear[1]));
-        out.push(expr("blinkRight", ear[0]));
-        out.push(expr("blink", (ear[0] + ear[1]) * 0.5));
+        out.push(expr("eyeBlinkLeft", blink_l));
+        out.push(expr("eyeBlinkRight", blink_r));
+        out.push(expr("blinkLeft", blink_r));
+        out.push(expr("blinkRight", blink_l));
+        out.push(expr("blink", (blink_l + blink_r) * 0.5));
         out.push(expr("jawOpen", jaw));
         out.push(expr("aa", jaw));
         out
@@ -588,6 +650,23 @@ impl FaceRtmpose {
             source: crate::tracking::FaceSource::Mesh,
             ..Default::default()
         })
+    }
+}
+
+#[cfg(test)]
+impl FaceRtmpose {
+    fn new_for_tests() -> Self {
+        Self {
+            child: None,
+            python: String::new(),
+            script: std::path::PathBuf::new(),
+            canonical: Vec::new(),
+            wflw_to_mp478: Vec::new(),
+            blend: None,
+            ear_base: [f32::NAN; 3],
+            blink_latched: [false; 2],
+            fail_run: 0,
+        }
     }
 }
 
@@ -648,4 +727,128 @@ fn load_npy3(path: &Path) -> Result<Vec<[f32; 3]>, String> {
         .chunks_exact(3)
         .map(|c| [c[0], c[1], c[2]])
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sim_solve_recovers_rotation_scale_translation() {
+        // The Procrustes must recover a ~20° rotated, scaled, translated
+        // target (the desk head-yaw regime) — the identity-rotation bug
+        // in svd2 made this residual ~80 px, tripping the > 60 px gate
+        // and killing the whole face chain.
+        let theta = 20.0f64.to_radians();
+        let r = [[theta.cos(), -theta.sin()], [theta.sin(), theta.cos()]];
+        let scale = 1.17f64;
+        let t = [42.0, -17.0];
+        let src: Vec<[f64; 2]> = (0..98)
+            .map(|i| {
+                let a = i as f64 * 0.618;
+                [(a * 7.0).sin() * 90.0 + 130.0, (a * 11.0).cos() * 60.0 + 140.0]
+            })
+            .collect();
+        let dst: Vec<[f64; 2]> = src
+            .iter()
+            .map(|p| {
+                [
+                    scale * (r[0][0] * p[0] + r[1][0] * p[1]) + t[0],
+                    scale * (r[0][1] * p[0] + r[1][1] * p[1]) + t[1],
+                ]
+            })
+            .collect();
+        let sim = sim_solve(&src, &dst).expect("sim must solve");
+        let err: f64 = src
+            .iter()
+            .zip(&dst)
+            .map(|(s, d)| {
+                let q = sim.apply(*s);
+                ((q[0] - d[0]).powi(2) + (q[1] - d[1]).powi(2)).sqrt()
+            })
+            .sum::<f64>()
+            / src.len() as f64;
+        assert!(err.sqrt() < 1e-6, "residual {err}");
+    }
+
+    #[test]
+    fn ear_distinguishes_open_and_closed_eye() {
+        // WFLW98 eye ring at slots 60..68. The baseline EMA seeds from
+        // the first (open) frame, so feeding a closed ring afterwards
+        // must drop eyeBlinkLeft well below the open baseline.
+        let mut face = FaceRtmpose::new_for_tests();
+        let open: Vec<[f64; 2]> = (0..98)
+            .map(|i| {
+                let (x, y) = match i {
+                    60..=67 => ((i - 60) as f64 * 10.0, ((i - 60) as f64 * 3.0).sin() * 8.0 + 100.0),
+                    68..=75 => (200.0 + (i - 68) as f64 * 10.0, ((i - 68) as f64 * 3.0).sin() * 8.0 + 100.0),
+                    76..=95 => (100.0 + (i - 76) as f64 * 5.0, 160.0),
+                    _ => (50.0 + i as f64, 50.0 + i as f64),
+                };
+                [x, y]
+            })
+            .collect();
+        let _ = face.geometric_expressions(&open);
+        let closed: Vec<[f64; 2]> = open
+            .iter()
+            .enumerate()
+            .map(|(i, p)| if (60..=67).contains(&i) { [p[0], 100.0] } else { *p })
+            .collect();
+        let exprs = face.geometric_expressions(&closed);
+        let blink_l = exprs.iter().find(|e| e.name == "eyeBlinkLeft").unwrap().weight;
+        assert!(
+            blink_l > 0.5,
+            "closed eye should read as blink (weight {blink_l})"
+        );
+        // latch releases and the channel returns to ~0 once the ring
+        // re-opens past BLINK_EXIT
+        let open_exprs = face.geometric_expressions(&open);
+        let open_v = open_exprs.iter().find(|e| e.name == "eyeBlinkLeft").unwrap().weight;
+        assert!(open_v < 0.2, "open eye {open_v} should read as not-blinking");
+
+        // jaw: a flat mouth line reads closed; a tall ring reads open
+        let mut shut = face.geometric_expressions(&open);
+        let jaw_shut = shut.iter().find(|e| e.name == "jawOpen").unwrap().weight;
+        assert!(jaw_shut < 0.2, "flat mouth jawOpen {jaw_shut}");
+        let open_mouth: Vec<[f64; 2]> = open
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if (76..=88).contains(&i) {
+                    [p[0], p[1] - 30.0]
+                } else if (88..=95).contains(&i) {
+                    [p[0], p[1] + 30.0]
+                } else {
+                    *p
+                }
+            })
+            .collect();
+        let talking = face.geometric_expressions(&open_mouth);
+        let jaw_open = talking.iter().find(|e| e.name == "jawOpen").unwrap().weight;
+        assert!(jaw_open > 0.5, "open mouth jawOpen {jaw_open}");
+    }
+
+    #[test]
+    fn svd2_returns_u_not_v() {
+        // An anisotropic asymmetric matrix: U must differ from V and
+        // reconstruct m = U Σ V^T.
+        let m = [[3.0, 1.0], [0.5, 2.0]];
+        let (u, s, vt) = svd2(m);
+        let mut rec = [[0.0f64; 2]; 2];
+        for i in 0..2 {
+            for j in 0..2 {
+                rec[i][j] = u[i][0] * s[0] * vt[0][j] + u[i][1] * s[1] * vt[1][j];
+            }
+        }
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!((rec[i][j] - m[i][j]).abs() < 1e-9);
+            }
+        }
+        // proper rotations: det ≈ +1 for both factors
+        let det_u = u[0][0] * u[1][1] - u[0][1] * u[1][0];
+        let det_vt = vt[0][0] * vt[1][1] - vt[0][1] * vt[1][0];
+        assert!((det_u - 1.0).abs() < 1e-9, "det u {det_u}");
+        assert!((det_vt - 1.0).abs() < 1e-9, "det vt {det_vt}");
+    }
 }
