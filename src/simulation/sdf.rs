@@ -55,19 +55,21 @@ pub const GRID_LEAN_PAD_M: f32 = 0.12;
 const OUTSIDE_VALUE: f32 = SHELL_METRES * 2.0;
 
 /// Hard cap on total cells so a huge avatar AABB cannot balloon the
-/// per-frame readback. ~1.26 M cells × 4 B ≈ 5.0 MB — still under the
+/// per-frame readback. ~0.7 M cells × 4 B ≈ 2.8 MB — well under the
 /// full-frame pixel readback (8 MB) the pipeline already sustains at
-/// 30 Hz. Sized so a Yumeka-class grid (T-pose X span, full-height Y)
-/// keeps its 10 mm voxel WITH the Z lean pad folded in and ~20 % slack
-/// for larger garments (at the old 1.05 M cap the padded grid landed
-/// 2.6 % under and any slightly bigger model fell to 12.5 mm voxels).
+/// 60 Hz. A Yumeka-class grid (T-pose X span, full-height Y, Z lean pad
+/// folded in) lands 12.5 mm voxels at ~553 k cells with ~26 % slack for
+/// larger garments — the same proportion of slack the old 1.26 M cap
+/// gave the 10 mm grid.
 ///
-/// `VULVATAR_SDF_MAX_CELLS` overrides for A/B. The splat's atomicMin
-/// stream scales with cell count (and per-triangle coverage), so this
-/// cap is also the GPU-cost dial: the 2026-09-25 live campaign measured
-/// the 1.02 M-cell 10 mm grid costing 15-21 ms/frame of splat — see
+/// The 2026-09-25 60 fps campaign set this cap: the splat's atomicMin
+/// stream scales with cell count AND per-triangle cell coverage, and the
+/// 1.02 M-cell 10 mm grid measured 15-21 ms/frame of GPU (the last
+/// GPU-side blocker). Contact metrics at the coarser grid are
+/// equal-or-better (`diagnostics/sdf_hair_stride{1_default,4_700k}`).
+/// `VULVATAR_SDF_MAX_CELLS` overrides for A/B; see
 /// `renderer/sdf_field.rs` (`splat_stride`) for the other dial.
-const MAX_CELLS: usize = 1_260_000;
+const MAX_CELLS: usize = 700_000;
 
 fn max_cells() -> usize {
     static CELLS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -302,9 +304,16 @@ mod tests {
         assert!(g.origin[0] >= aabb.min[0] - SHELL_METRES - 1e-4);
         assert!(g.origin[1] >= aabb.min[1] - SHELL_METRES - 1e-4);
         assert!(g.cell_count() <= MAX_CELLS);
+        // The 700 k cap (2026-09-25 60 fps campaign — the splat's
+        // atomicMin stream scales with cells × per-triangle coverage)
+        // coarsens this Yumeka-shaped grid one candidate step, to
+        // 12.5 mm. That step is the accepted trade (contact metrics
+        // equal-or-better, `diagnostics/sdf_hair_stride{1_default,4_700k}`);
+        // what the pad must NOT do is eat ANOTHER candidate — the grid
+        // has to land on 12.5 mm with the lean pad folded in, not 16 mm.
         assert!(
-            (g.voxel - 0.010).abs() < 1e-6,
-            "voxel coarsened to {:.4} m — the pad ate the budget",
+            (g.voxel - 0.0125).abs() < 1e-6,
+            "voxel landed at {:.4} m — expected the one-step 12.5 mm trade",
             g.voxel
         );
     }

@@ -75,10 +75,19 @@ pub(super) struct SplatPrimInput {
 }
 
 /// Triangle decimation stride for the splat dispatch
-/// (`VULVATAR_SDF_SPLAT_STRIDE`, 1 = every triangle). Evaluated once per
-/// process; the value lands in the slot's params UBO, so changing it
-/// requires an avatar reload (or process restart) — acceptable for an
-/// operator A/B knob.
+/// (`VULVATAR_SDF_SPLAT_STRIDE`). Default 4: invocation i splats
+/// triangle `i * 4`, sampling the surface every 4th triangle. The
+/// ≥12.5 mm voxel grid cannot distinguish that on dense meshes
+/// (Yumeka's body triangles are ~5 mm), while the redundant atomicMin
+/// stream the skipped triangles produced measured 15-21 ms/frame of
+/// GPU — the last GPU-side blocker of the 60 fps budget (2026-09-25,
+/// RENDER_PROF with `VULVATAR_NO_BODY_SDF=1` as the A/B reference;
+/// stride 4 + the 700 k cell cap took the splat frames to 5-6 ms).
+/// Contact metrics are equal-or-better at stride 4
+/// (`diagnostics/sdf_hair_stride{1_default,4_700k}`: penetrating
+/// chains 5 → 4, min-gap deltas ±0.3-1.2 mm mostly in the A/B's
+/// favour). Evaluated once per process; the value lands in the slot's
+/// params UBO, so changing it requires an avatar reload.
 fn splat_stride() -> u32 {
     static STRIDE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *STRIDE.get_or_init(|| {
@@ -86,7 +95,7 @@ fn splat_stride() -> u32 {
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
             .map(|v| v.clamp(1, 64))
-            .unwrap_or(1)
+            .unwrap_or(4)
     })
 }
 
