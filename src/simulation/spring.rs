@@ -71,7 +71,14 @@ const NATURAL_STIFFNESS_RATE_GAIN: f32 = 7.0;
 /// Extra clearance beyond the strand's own `radius` when resolving
 /// against the body distance field. Keeps the sampled distance at the
 /// isosurface from re-triggering contacts after trilinear smoothing.
-const SDF_CONTACT_MARGIN: f32 = 0.004;
+/// 4 → 5 mm with the 2026-09-25 splat defaults (stride 4 + 12.5 mm
+/// voxels): `diagnose_sdf_surface_error` measured the field
+/// overestimating by ~+1 mm more in the contact band than at the old
+/// 10 mm / stride-1 settings, so this margin compensates to keep the
+/// effective strand-skin gap where the `sdf_hair` A/B validated it.
+/// Re-measure with `diagnose_sdf_surface_error` when the splat settings
+/// change — this margin and the field error are a pair.
+const SDF_CONTACT_MARGIN: f32 = 0.005;
 
 /// Verlet integration-based spring bone solver.
 ///

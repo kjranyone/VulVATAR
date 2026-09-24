@@ -46,8 +46,16 @@ const PIN_BAND_HEIGHT_FRACTION: f32 = 0.4;
 /// Skirt classifier bone-weight threshold (Phase 1 parity).
 const SKIRT_WEIGHT_RATIO: f32 = 0.4;
 /// Default body-SDF contact band for auto-cloth garments (metres).
-/// Measured sweet spot of the `skirt_*_sdfbend` A/B set (2026-09-16).
-const AUTO_CLOTH_SDF_CONTACT_M: f32 = 0.004;
+/// Measured sweet spot of the `skirt_*_sdfbend` A/B set (2026-09-16);
+/// 4 → 5 mm after the 2026-09-25 splat-decimation defaults (stride 4 +
+/// 12.5 mm voxels): `diagnose_sdf_surface_error` measured the field
+/// overestimating surface distance by p50 +3.8 mm at the skin (was
+/// +2.9 mm at 10 mm/stride 1), so the effective cloth-skin gap at a 4 mm
+/// target shrank to ~0.2 mm and the skin started poking through tight
+/// areas. 5 mm restores the old effective gap (~1.1 mm) at zero GPU
+/// cost. Re-run `diagnose_sdf_surface_error` whenever the splat
+/// settings change — this margin and the field error are a pair.
+const AUTO_CLOTH_SDF_CONTACT_M: f32 = 0.005;
 
 /// Build one `ClothAsset` per skirt-classified primitive on the avatar.
 /// The instance must have its rest pose built (base pose → global pose
