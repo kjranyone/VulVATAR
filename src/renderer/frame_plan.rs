@@ -36,6 +36,19 @@
 //! tracking anchors moved from push constants to a small uniform ring
 //! (see `background.rs`), which is precisely what lets a cached recording
 //! keep animating.
+//!
+//! Ring depths are **1** everywhere (see `FRAME_LAG` in `mod.rs`): the
+//! rings rotate their slot with the frame counter, and a rotating slot is
+//! recording-visible identity (the cached CB binds that slot's set), so
+//! depth >1 multiplied the key space by LCM(periods) = 6 while the sdf /
+//! cloth gate states contributed ~4 more combinations — 24 keys against a
+//! 16-entry LRU whose reuse window is 6 frames. Measured at 60 Hz:
+//! cb_misses == frame count, 0% hits, every frame re-recording. With
+//! single-slot rings the only surviving churn is the sdf Some/None and
+//! cloth substeps gate states, each of which stays cached, so steady-state
+//! hits ~100%. `VULVATAR_CB_KEYDIFF=1` diffs the per-section hashes
+//! ([`KEY_SECTIONS`]) frame-to-frame on every miss to localise future
+//! churn.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -190,6 +203,10 @@ pub(super) struct FramePlan {
     /// docs). Equal keys ⇒ a cached recording is byte-equivalent to what
     /// re-recording would produce.
     pub(super) shape_key: u64,
+    /// The per-section breakdown behind `shape_key`
+    /// ([`shape_key_sections`], ids index [`KEY_SECTIONS`]) — only read by
+    /// the `VULVATAR_CB_KEYDIFF=1` miss-diff diagnostic.
+    pub(super) shape_sections: Vec<(usize, u64)>,
 }
 
 fn hash_arc<T>(hasher: &mut DefaultHasher, arc: &Arc<T>) {
@@ -359,121 +376,228 @@ impl VulkanRenderer {
             depth_image,
             depth_buffer,
             shape_key: 0,
+            shape_sections: Vec::new(),
         };
+        plan.shape_sections = shape_key_sections(self, &plan);
         plan.shape_key = self.compute_shape_key(&plan);
         Ok(plan)
     }
 
     /// Hash every command-buffer-visible identity and value of the plan
     /// (see module docs for the safety argument).
+    ///
+    /// The key folds per-section hashes (see [`shape_key_sections`]); the
+    /// section breakdown is what `VULVATAR_CB_KEYDIFF=1` diffs frame-to-
+    /// frame to localise cache-thrashing components.
     fn compute_shape_key(&self, plan: &FramePlan) -> u64 {
         let mut h = DefaultHasher::new();
-        h.write_u32(self.current_extent[0]);
-        h.write_u32(self.current_extent[1]);
-
-        hash_arc(&mut h, &plan.camera_set);
-        hash_arc(&mut h, &plan.outline_camera_set);
-        match (&plan.bg_pipeline, &plan.bg_set) {
-            (Some(p), Some(s)) => {
-                h.write_u8(1);
-                hash_arc(&mut h, p);
-                hash_arc(&mut h, s);
-            }
-            _ => h.write_u8(0),
+        for (_, sh) in &plan.shape_sections {
+            h.write_u64(*sh);
         }
+        h.finish()
+    }
+}
+
+/// Named sections of the shape key, in fold order. Ids are stable within a
+/// process build; only equality of the per-section hashes is meaningful.
+pub(super) const KEY_SECTIONS: [&str; 17] = [
+    "extent",
+    "camera_ring",
+    "bg",
+    "clear",
+    "skinning_sets",
+    "transform_prims",
+    "sdf",
+    "cloth_sets",
+    "cloth_counts",
+    "cloth_constraints",
+    "cloth_normal",
+    "cloth_collide",
+    "cloth_selfcol",
+    "copies",
+    "draws",
+    "post",
+    "readback",
+];
+
+fn section_hash(f: impl FnOnce(&mut DefaultHasher)) -> u64 {
+    let mut h = DefaultHasher::new();
+    f(&mut h);
+    h.finish()
+}
+
+fn push_section(sections: &mut Vec<(usize, u64)>, id: usize, f: impl FnOnce(&mut DefaultHasher)) {
+    sections.push((id, section_hash(f)));
+}
+
+/// Per-section hashes in the same order as [`KEY_SECTIONS`].
+pub(super) fn shape_key_sections(
+    renderer: &VulkanRenderer,
+    plan: &FramePlan,
+) -> Vec<(usize, u64)> {
+    let mut sections = Vec::with_capacity(KEY_SECTIONS.len());
+
+    push_section(&mut sections, 0, |h| {
+        h.write_u32(plan_extent(renderer)[0]);
+        h.write_u32(plan_extent(renderer)[1]);
+    });
+    push_section(&mut sections, 1, |h| {
+        hash_arc(h, &plan.camera_set);
+        hash_arc(h, &plan.outline_camera_set);
+    });
+    push_section(&mut sections, 2, |h| match (&plan.bg_pipeline, &plan.bg_set) {
+        (Some(p), Some(s)) => {
+            h.write_u8(1);
+            hash_arc(h, p);
+            hash_arc(h, s);
+        }
+        _ => h.write_u8(0),
+    });
+    push_section(&mut sections, 3, |h| {
         for c in plan.clear {
             h.write_u32(c.to_bits());
         }
-
+    });
+    push_section(&mut sections, 4, |h| {
         for inst in &plan.instances {
-            hash_arc(&mut h, &inst.skinning_set);
+            hash_arc(h, &inst.skinning_set);
+        }
+    });
+    push_section(&mut sections, 5, |h| {
+        for inst in &plan.instances {
             for prim in &inst.prims {
-                hash_arc(&mut h, &prim.transform_set);
+                hash_arc(h, &prim.transform_set);
                 h.write_u32(prim.groups[0]);
-                // Body-SDF splat resources are bound by the recorded
-                // command buffer too — same command-buffer-visible
-                // identity rule as the cloth sets above.
-                if let Some(sdf) = &inst.sdf {
+            }
+        }
+    });
+    push_section(&mut sections, 6, |h| {
+        for inst in &plan.instances {
+            match &inst.sdf {
+                Some(sdf) => {
                     h.write_u8(1);
                     h.write_usize(sdf.dispatches.len());
                     for (set, groups) in &sdf.dispatches {
-                        hash_arc(&mut h, set);
+                        hash_arc(h, set);
                         h.write_u32(groups[0]);
                     }
-                    sdf.field.hash(&mut h);
-                } else {
-                    h.write_u8(0);
+                    sdf.field.hash(h);
                 }
-                if let Some(cloth) = &prim.cloth {
-                    h.write_u8(1);
-                    hash_arc(&mut h, &cloth.verlet_set);
-                    h.write_u32(cloth.groups[0]);
-                    h.write_u32(cloth.substeps);
-                    h.write_u32(cloth.constraint_iters);
-                    if let Some(cs) = &cloth.constraints {
+                None => h.write_u8(0),
+            }
+        }
+    });
+    push_section(&mut sections, 7, |h| {
+        for inst in &plan.instances {
+            for prim in &inst.prims {
+                match &prim.cloth {
+                    Some(cloth) => {
                         h.write_u8(1);
-                        hash_arc(&mut h, &cs.lambda_update_set);
-                        hash_arc(&mut h, &cs.accumulate_set);
-                        hash_arc(&mut h, &cs.apply_set);
-                        h.write_u32(cs.constraint_count);
-                        h.write_u32(cs.constraint_groups);
-                    } else {
-                        h.write_u8(0);
+                        hash_arc(h, &cloth.verlet_set);
                     }
-                    if let Some(n) = &cloth.normal {
-                        h.write_u8(1);
-                        hash_arc(&mut h, &n.set);
-                    } else {
-                        h.write_u8(0);
-                    }
-                    // S2.2/S2.3 collision resources are bound by the
-                    // recorded command buffer too — their (re)allocation
-                    // must invalidate the cached recording. (R1 moved
-                    // collision INTO the substep loop; these sets are now
-                    // dispatched substeps × per frame.)
-                    if let Some(c) = &cloth.collide {
-                        h.write_u8(1);
-                        hash_arc(&mut h, &c.set);
-                        h.write_u32(c.collider_count);
-                    } else {
-                        h.write_u8(0);
-                    }
-                    if let Some(sc) = &cloth.selfcol {
-                        h.write_u8(1);
-                        hash_arc(&mut h, &sc.build_set);
-                        hash_arc(&mut h, &sc.resolve_set);
-                        sc.counts_ssbo.hash(&mut h);
-                    } else {
-                        h.write_u8(0);
-                    }
-                    // R3 containment history copies are
-                    // command-buffer-visible buffer identities.
-                    h.write_usize(plan.containment_copies.len());
-                    for (src, dst) in &plan.containment_copies {
-                        src.hash(&mut h);
-                        dst.hash(&mut h);
-                    }
-                    // R2 audit copies likewise.
-                    h.write_usize(plan.audit_copies.len());
-                    for (src, dst) in &plan.audit_copies {
-                        src.hash(&mut h);
-                        dst.hash(&mut h);
-                    }
-                } else {
-                    h.write_u8(0);
+                    None => h.write_u8(0),
                 }
             }
         }
-
+    });
+    push_section(&mut sections, 8, |h| {
+        for inst in &plan.instances {
+            for prim in &inst.prims {
+                match &prim.cloth {
+                    Some(cloth) => {
+                        h.write_u8(1);
+                        h.write_u32(cloth.groups[0]);
+                        h.write_u32(cloth.substeps);
+                        h.write_u32(cloth.constraint_iters);
+                    }
+                    None => h.write_u8(0),
+                }
+            }
+        }
+    });
+    push_section(&mut sections, 9, |h| {
+        for inst in &plan.instances {
+            for prim in &inst.prims {
+                match &prim.cloth.as_ref().and_then(|c| c.constraints.as_ref()) {
+                    Some(cs) => {
+                        h.write_u8(1);
+                        hash_arc(h, &cs.lambda_update_set);
+                        hash_arc(h, &cs.accumulate_set);
+                        hash_arc(h, &cs.apply_set);
+                        h.write_u32(cs.constraint_count);
+                        h.write_u32(cs.constraint_groups);
+                    }
+                    None => h.write_u8(0),
+                }
+            }
+        }
+    });
+    push_section(&mut sections, 10, |h| {
+        for inst in &plan.instances {
+            for prim in &inst.prims {
+                match &prim.cloth.as_ref().and_then(|c| c.normal.as_ref()) {
+                    Some(n) => {
+                        h.write_u8(1);
+                        hash_arc(h, &n.set);
+                    }
+                    None => h.write_u8(0),
+                }
+            }
+        }
+    });
+    push_section(&mut sections, 11, |h| {
+        for inst in &plan.instances {
+            for prim in &inst.prims {
+                match &prim.cloth.as_ref().and_then(|c| c.collide.as_ref()) {
+                    Some(c) => {
+                        h.write_u8(1);
+                        hash_arc(h, &c.set);
+                        h.write_u32(c.collider_count);
+                    }
+                    None => h.write_u8(0),
+                }
+            }
+        }
+    });
+    push_section(&mut sections, 12, |h| {
+        for inst in &plan.instances {
+            for prim in &inst.prims {
+                match &prim.cloth.as_ref().and_then(|c| c.selfcol.as_ref()) {
+                    Some(sc) => {
+                        h.write_u8(1);
+                        hash_arc(h, &sc.build_set);
+                        hash_arc(h, &sc.resolve_set);
+                        sc.counts_ssbo.hash(h);
+                    }
+                    None => h.write_u8(0),
+                }
+            }
+        }
+    });
+    push_section(&mut sections, 13, |h| {
+        // Containment history copies + audit copies are command-buffer-
+        // visible buffer identities; allocation churn invalidates.
+        h.write_usize(plan.containment_copies.len());
+        for (src, dst) in &plan.containment_copies {
+            src.hash(h);
+            dst.hash(h);
+        }
+        h.write_usize(plan.audit_copies.len());
+        for (src, dst) in &plan.audit_copies {
+            src.hash(h);
+            dst.hash(h);
+        }
+    });
+    push_section(&mut sections, 14, |h| {
         for draw in &plan.draws {
-            hash_arc(&mut h, &draw.pipeline);
+            hash_arc(h, &draw.pipeline);
             h.write_u8(match draw.alpha_mode {
                 frame_input::RenderAlphaMode::Opaque => 0,
                 frame_input::RenderAlphaMode::Blend => 1,
                 frame_input::RenderAlphaMode::Cutout => 2,
             });
             h.write_u32(draw.index_count);
-            hash_arc(&mut h, &draw.material_set);
+            hash_arc(h, &draw.material_set);
             match draw.outline {
                 Some((w, color)) => {
                     h.write_u8(1);
@@ -485,19 +609,27 @@ impl VulkanRenderer {
                 None => h.write_u8(0),
             }
         }
-
+    });
+    push_section(&mut sections, 15, |h| {
         h.write_u8(u8::from(plan.use_bloom));
         h.write_u32(plan.bloom.threshold.to_bits());
         h.write_u32(plan.composite_intensity.to_bits());
-        if let Some(post) = self.post_effects.as_ref() {
-            hash_arc(&mut h, &post.pipe_composite);
+        if let Some(post) = renderer.post_effects.as_ref() {
+            hash_arc(h, &post.pipe_composite);
             if plan.use_bloom {
-                hash_arc(&mut h, &post.pipe_down);
-                hash_arc(&mut h, &post.pipe_up);
+                hash_arc(h, &post.pipe_down);
+                hash_arc(h, &post.pipe_up);
             }
         }
+    });
+    push_section(&mut sections, 16, |h| {
         h.write_usize(plan.readback_slot);
         h.write_u8(u8::from(plan.depth_buffer.is_some()));
-        h.finish()
-    }
+    });
+    sections
+}
+
+/// The renderer's current extent, without borrowing the plan.
+fn plan_extent(renderer: &VulkanRenderer) -> [u32; 2] {
+    renderer.current_extent
 }

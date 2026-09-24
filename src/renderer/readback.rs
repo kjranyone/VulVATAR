@@ -47,7 +47,13 @@ pub(super) struct PendingReadbackState {
     pub(super) color_space: frame_input::RenderColorSpace,
 }
 
-pub(super) const READBACK_RING_SIZE: usize = 2;
+/// Readback ring depth. **1** — `render` waits the previous frame's fence
+/// (harvest) before recording the next, so the single pair is never
+/// CPU-mapped while the GPU writes it. Depth >1 made the rotating slot part
+/// of the shape key (the cached CB copies into that slot's buffers),
+/// multiplying the key space past the LRU cap at 60 Hz — see `FRAME_LAG`
+/// in `mod.rs` for the measured 0%-hit mechanism.
+pub(super) const READBACK_RING_SIZE: usize = 1;
 
 impl VulkanRenderer {
     /// Drain the pipelined CPU-readback queue, returning `Some(RenderResult)`

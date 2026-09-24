@@ -556,6 +556,9 @@ pub struct VulkanRenderer {
     /// Cleared at every site that swaps a command-buffer-visible
     /// resource; LRU-capped at [`CB_CACHE_CAP`].
     cb_cache: HashMap<u64, CachedFrameCb>,
+    /// Previous frame's shape-key section hashes (`VULVATAR_CB_KEYDIFF=1`
+    /// miss-diff diagnostic — localises which plan component churns).
+    last_shape_sections: Option<Vec<(usize, u64)>>,
 
     /// Per-avatar-instance body-SDF splat resources (field + params UBO
     /// + descriptor set). See `sdf_field.rs`.
@@ -667,13 +670,14 @@ impl VulkanRenderer {
             camera_ring: None,
             bg_uniform_ring: None,
             cb_cache: HashMap::new(),
+            last_shape_sections: None,
             sdf_slots: HashMap::new(),
             sdf_pipeline: None,
             sdf_planned: Vec::new(),
 
-            staging_buffers: [None, None],
-            readback_buffers: [None, None],
-            readback_cpu_pool: [None, None],
+            staging_buffers: std::array::from_fn(|_| None),
+            readback_buffers: std::array::from_fn(|_| None),
+            readback_cpu_pool: std::array::from_fn(|_| None),
             readback_slot: 0,
             pending_readback: None,
             prof_ts_pool: None,
@@ -1112,9 +1116,9 @@ impl VulkanRenderer {
         // Invalidate pre-allocated readback buffers (extent changed), the
         // CPU pixel pool (sized to the old extent), and any cached command
         // buffers (they reference the old pipelines / targets / buffers).
-        self.staging_buffers = [None, None];
-        self.readback_buffers = [None, None];
-        self.readback_cpu_pool = [None, None];
+        self.staging_buffers = std::array::from_fn(|_| None);
+        self.readback_buffers = std::array::from_fn(|_| None);
+        self.readback_cpu_pool = std::array::from_fn(|_| None);
         self.cb_cache.clear();
 
         info!("renderer: resized to {}x{}", new_extent[0], new_extent[1]);
@@ -1474,10 +1478,18 @@ impl VulkanRenderer {
     }
 
     /// A/B knob for the command-buffer cache (`VULVATAR_CB_CACHE=0`
-    /// re-records + rebuilds every frame). Evaluated once per process.
+    /// re-records + rebuilds every frame). **On by default** — an A/B
+    /// during the 2026-09-22 GPU-coexistence campaign flipped the default
+    /// to OFF via an `is_ok_and` env read (unset ⇒ disabled) and it
+    /// silently stayed there: every frame re-recorded for days while the
+    /// counters read 0% hits. Restored ON together with the ring depths
+    /// collapsing to 1 (see `FRAME_LAG`) — with the rotating slots out of
+    /// the shape key, the LRU holds every live sdf/cloth gate combination
+    /// and steady-state hits ~100% (measured, `profile/render_prof.log`).
+    /// Evaluated once per process.
     fn cb_cache_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var("VULVATAR_CB_CACHE").is_ok_and(|v| v != "0"))
+        *ENABLED.get_or_init(|| std::env::var("VULVATAR_CB_CACHE").map_or(true, |v| v != "0"))
     }
 
     /// Profiling knob (`VULVATAR_RENDER_PROF=1`): GPU timestamp
@@ -1488,6 +1500,62 @@ impl VulkanRenderer {
     fn render_prof_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("VULVATAR_RENDER_PROF").is_ok_and(|v| v == "1"))
+    }
+
+    /// Diagnostic knob (`VULVATAR_CB_KEYDIFF=1`): on every CB-cache miss,
+    /// log which shape-key sections differ from the previous frame.
+    /// Localises cache thrashing without recording anything new.
+    fn cb_keydiff_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("VULVATAR_CB_KEYDIFF").is_ok_and(|v| v == "1"))
+    }
+
+    /// Compare `plan.shape_sections` against the previous frame's and log
+    /// the differing section names. Throttled: the first 20 misses plus
+    /// every 200th, so steady-state churn stays readable.
+    fn log_shape_key_diff(&mut self, plan: &frame_plan::FramePlan) {
+        let prev = self.last_shape_sections.take();
+        let verbose = self.cb_cache_misses_total() <= 20
+            || self.cb_cache_misses_total().is_multiple_of(200);
+        if verbose {
+            if let Some(prev) = prev.as_ref() {
+                let mut changed: Vec<&str> = Vec::new();
+                for ((id_new, h_new), (id_old, h_old)) in
+                    plan.shape_sections.iter().zip(prev.iter())
+                {
+                    if id_new != id_old || h_new != h_old {
+                        changed.push(
+                            frame_plan::KEY_SECTIONS.get(*id_new).copied().unwrap_or("?"),
+                        );
+                    }
+                }
+                let lens = if plan.shape_sections.len() == prev.len() {
+                    String::new()
+                } else {
+                    format!(
+                        " (len {} -> {})",
+                        prev.len(),
+                        plan.shape_sections.len()
+                    )
+                };
+                println!(
+                    "CB_KEYDIFF frame={} miss#{} changed=[{}]{}",
+                    self.frame_counter,
+                    self.cb_cache_misses_total(),
+                    if changed.is_empty() {
+                        "NONE — sections identical, key must differ elsewhere".to_string()
+                    } else {
+                        changed.join(",")
+                    },
+                    lens,
+                );
+            }
+        }
+        self.last_shape_sections = Some(plan.shape_sections.clone());
+    }
+
+    fn cb_cache_misses_total(&self) -> u64 {
+        self.gpu_runtime_counters.cb_cache_misses
     }
 
     /// Read the previous frame's final-VBO audit rows from the
@@ -1537,10 +1605,14 @@ impl VulkanRenderer {
             if let Some(entry) = self.cb_cache.get_mut(&plan.shape_key) {
                 entry.last_used = self.frame_counter;
                 self.gpu_runtime_counters.cb_cache_hits += 1;
+                self.last_shape_sections = Some(plan.shape_sections.clone());
                 return Ok(entry.cb.clone());
             }
         }
         self.gpu_runtime_counters.cb_cache_misses += 1;
+        if Self::cb_keydiff_enabled() {
+            self.log_shape_key_diff(plan);
+        }
         let cb = self.build_frame_cb(plan)?;
         if Self::cb_cache_enabled() {
             if self.cb_cache.len() >= CB_CACHE_CAP {
@@ -1962,7 +2034,18 @@ fn mat4_cols_identity() -> [[f32; 4]; 4] {
     crate::asset::identity_matrix()
 }
 
-const FRAME_LAG: usize = 3;
+/// Camera UBO ring depth. **1** — the ring is a fossil of a deeper
+/// pipelining scheme that never shipped: `render` harvests the previous
+/// frame's fence (Phase 1) before any per-frame CPU write (Phase 2) and
+/// only then submits (Phase 3), so at most one frame is ever in flight and
+/// a single UBO is never rewritten while the GPU reads it. Depth >1 actively
+/// breaks the command-buffer cache: the rotating slot is
+/// recording-visible identity (the cached CB binds that slot's descriptor
+/// set), so N slots multiply the shape-key space and at 60 Hz the reuse
+/// window (LCM of all ring periods, 6 frames with the old 3/2/2) exceeded
+/// the LRU's ability to hold every combination — measured 0% hits
+/// (`diagnostics` note 2026-09-25, RENDER_PROF cb_misses == frame count).
+const FRAME_LAG: usize = 1;
 
 struct CameraRing {
     buffers: Vec<Subbuffer<CameraUniform>>,

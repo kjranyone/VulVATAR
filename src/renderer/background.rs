@@ -361,11 +361,13 @@ pub(super) fn record_background(
     Ok(())
 }
 
-/// Depth of the per-frame uniform ring. Two slots match the readback ring's
-/// in-flight depth: `render` writes slot `frame % 2` only after the previous
-/// frame's fence was waited on, so a slot is never rewritten while the GPU
-/// still reads it.
-pub(super) const BG_UNIFORM_RING_SIZE: usize = 2;
+/// Depth of the per-frame uniform ring. **1** — see `FRAME_LAG` in
+/// `mod.rs`: `render` writes the uniform only after the previous frame's
+/// fence was waited on (one frame in flight), so there is no older slot to
+/// protect, and any depth >1 makes the rotating slot part of the shape key
+/// (the cached CB binds that slot's set), thrashing the command-buffer
+/// cache at 60 Hz.
+pub(super) const BG_UNIFORM_RING_SIZE: usize = 1;
 
 /// Per-frame uniform buffers + descriptor sets for the background shader
 /// (the UBO replacement for the former push constants). Owned by
