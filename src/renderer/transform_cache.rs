@@ -285,12 +285,16 @@ impl VulkanRenderer {
         // cloth-bearing this frame; otherwise the shared stub. The render
         // loop rewrites `cloth_pos_ssbo` / `cloth_norm_ssbo` in place
         // whenever the cloth solver bumps its `version`.
+        // TRANSFER_SRC: the recorded cloth block ends with SSBO → staging
+        // copies so the per-frame readback maps cached host memory
+        // (measured 2026-09-25: reading the BAR-resident SSBOs directly
+        // cost 5.5 ms/map — see `cloth_cache::read_cloth_positions`).
         let cloth_pos_ssbo = if let (true, Some(p)) = (prev_had_cloth, previous.as_ref()) {
             p.cloth_pos_ssbo.clone()
         } else if has_cloth {
             gpu_alloc::host_buffer(
                 memory_allocator,
-                BufferUsage::STORAGE_BUFFER,
+                BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC,
                 (0..vertex_count).map(|_| [0.0_f32; 4]),
                 "cloth pos SSBO",
             )?
@@ -308,7 +312,7 @@ impl VulkanRenderer {
         } else if has_cloth_normals {
             gpu_alloc::host_buffer(
                 memory_allocator,
-                BufferUsage::STORAGE_BUFFER,
+                BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_SRC,
                 (0..vertex_count).map(|_| [0.0_f32; 4]),
                 "cloth norm SSBO",
             )?

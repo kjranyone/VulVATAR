@@ -82,6 +82,10 @@ pub(super) fn host_ubo<T: BufferContents>(
 /// into it, and the CPU maps it after the frame fence). Requires the
 /// `HOST_RANDOM_ACCESS` filter — `HOST_SEQUENTIAL_WRITE` memory is
 /// write-only by contract.
+///
+/// Lands in BAR on resizable-BAR GPUs (PREFER_DEVICE wins) — fine for
+/// small/diagnostic reads, wasteful for per-frame MB-scale ones; prefer
+/// [`host_cached_read_slice`] there.
 pub(super) fn host_read_slice<T: BufferContents>(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     len: u64,
@@ -92,6 +96,32 @@ pub(super) fn host_read_slice<T: BufferContents>(
         buffer_info(BufferUsage::TRANSFER_DST | BufferUsage::STORAGE_BUFFER),
         AllocationCreateInfo {
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_RANDOM_ACCESS,
+            ..Default::default()
+        },
+        len,
+    )
+    .map_err(|e| format!("renderer: {label} alloc failed: {e}"))
+}
+
+/// Host-READABLE staging in **cached system memory** (`PREFER_HOST`):
+/// the GPU copy pays PCIe write bandwidth (~0.3 ms per 5 MB on this
+/// link) but every CPU read hits the cache instead of an uncached BAR
+/// round-trip. The right type for per-frame MB-scale readbacks — the
+/// SDF field staging measured 10-25 ms/frame as BAR (2026-09-25,
+/// CPU_PROF `cpu_readback`). No dedicated `HOST_CACHED` filter exists
+/// in this vulkano; host memory types are cacheable, BAR is what the
+/// `PREFER_DEVICE` filter used to select.
+pub(super) fn host_cached_read_slice<T: BufferContents>(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    len: u64,
+    label: &str,
+) -> Result<Subbuffer<[T]>, String> {
+    Buffer::new_slice::<T>(
+        memory_allocator.clone(),
+        buffer_info(BufferUsage::TRANSFER_DST | BufferUsage::STORAGE_BUFFER),
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
                 | MemoryTypeFilter::HOST_RANDOM_ACCESS,
             ..Default::default()
         },

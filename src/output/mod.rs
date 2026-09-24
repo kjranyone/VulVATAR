@@ -86,6 +86,14 @@ pub struct OutputRouter {
     max_queue_depth: usize,
     next_frame_id: u64,
     dropped_count: u64,
+    /// Frames skipped by the router's own forward-throttle
+    /// (`forward_min_interval`). Deliberate pacing, not loss — kept out of
+    /// `dropped_count` because the GPU budget reads that counter as a
+    /// pressure signal, and the throttle's own skips previously fed back
+    /// as "output dropping frames" pressure (20+ skipped/s at a 30 fps
+    /// target ⇒ permanent PressureHeavy: the clamp manufactured the
+    /// pressure that blocked its own recovery — measured 2026-09-25).
+    throttled_count: u64,
     last_publish_timestamp: FrameTimestamp,
 
     /// Phase B-3: minimum interval between forwarded frames. The renderer
@@ -157,6 +165,7 @@ impl OutputRouter {
             max_queue_depth: 2,
             next_frame_id: 0,
             dropped_count: 0,
+            throttled_count: 0,
             last_publish_timestamp: 0,
             forward_min_interval: Duration::ZERO,
             last_forward_at: None,
@@ -352,7 +361,7 @@ impl OutputRouter {
             let now = Instant::now();
             if let Some(last) = self.last_forward_at {
                 if now.duration_since(last) < self.forward_min_interval {
-                    self.dropped_count += 1;
+                    self.throttled_count += 1;
                     Self::complete_gpu_lease(&self.lease_completion_tx, &frame);
                     return;
                 }
@@ -579,6 +588,15 @@ impl OutputRouter {
 
     pub fn dropped_count(&self) -> u64 {
         self.dropped_count
+    }
+
+    /// Frames skipped by the router's own forward-throttle — deliberate
+    /// pacing, reported separately from [`Self::dropped_count`] so the
+    /// GPU budget's drop-rate pressure signal only sees genuine loss
+    /// (see the `throttled_count` field doc for the feedback loop this
+    /// broke).
+    pub fn throttled_count(&self) -> u64 {
+        self.throttled_count
     }
 
     pub fn queue_depth(&self) -> usize {

@@ -696,7 +696,29 @@ impl Application {
                 "preserve_alpha": self.output_preserve_alpha,
                 "requested_sink": format!("{:?}", self.requested_sink()),
             },
-            "gpu_budget": format!("{:?}", self.runtime_gpu_budget.degraded_mode()),
+            "gpu_budget": {
+                // Not just the mode — the reason + signals. A stuck mode
+                // with no transitions in the log is undiagnosable without
+                // knowing WHICH pressure criterion keeps firing
+                // (2026-09-25: the permanent-PressureHeavy ratchet took a
+                // session to localise for exactly this reason).
+                "mode": format!("{:?}", self.runtime_gpu_budget.degraded_mode()),
+                "last_reason": self.runtime_gpu_budget.last_transition_reason().label(),
+                "render_fps_target": self.runtime_gpu_budget.render_fps_target(),
+                "pose_hz_target": self.runtime_gpu_budget.pose_hz_target(),
+                "output_drops_total": self.output.dropped_count(),
+                "output_throttled_total": self.output.throttled_count(),
+                "export_pool_leased": self
+                    .output
+                    .diagnostics()
+                    .export_pool
+                    .map(|p| p.leased_slots),
+                "export_pool_capacity": self
+                    .output
+                    .diagnostics()
+                    .export_pool
+                    .map(|p| p.capacity),
+            },
             "render": render_health,
         })
     }

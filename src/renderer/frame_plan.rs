@@ -93,6 +93,19 @@ pub(super) struct PlannedCloth {
     pub(super) normal: Option<PlannedClothNormal>,
     pub(super) collide: Option<PlannedClothCollide>,
     pub(super) selfcol: Option<PlannedClothSelfCol>,
+    /// Recorded after the normal pass: SSBO → cached-host staging so the
+    /// readback maps cached memory, not BAR (5.5 ms/map on the Arc driver
+    /// — see `ClothGpuSlot::pos_staging`). Buffers are
+    /// command-buffer-visible identities and hash into the key.
+    pub(super) readback: Option<PlannedClothReadback>,
+}
+
+/// The pos/norm staging copy pair for one cloth primitive.
+pub(super) struct PlannedClothReadback {
+    pub(super) pos_src: Subbuffer<[[f32; 4]]>,
+    pub(super) pos_dst: Subbuffer<[[f32; 4]]>,
+    pub(super) norm_src: Option<Subbuffer<[[f32; 4]]>>,
+    pub(super) norm_dst: Option<Subbuffer<[[f32; 4]]>>,
 }
 
 /// Bend stage (T09 edge-angle hinge): three dispatches per constraint
@@ -494,6 +507,21 @@ pub(super) fn shape_key_sections(
                     Some(cloth) => {
                         h.write_u8(1);
                         hash_arc(h, &cloth.verlet_set);
+                        if let Some(rb) = &cloth.readback {
+                            h.write_u8(1);
+                            rb.pos_src.hash(h);
+                            rb.pos_dst.hash(h);
+                            match (&rb.norm_src, &rb.norm_dst) {
+                                (Some(s), Some(d)) => {
+                                    h.write_u8(1);
+                                    s.hash(h);
+                                    d.hash(h);
+                                }
+                                _ => h.write_u8(0),
+                            }
+                        } else {
+                            h.write_u8(0);
+                        }
                     }
                     None => h.write_u8(0),
                 }

@@ -65,10 +65,6 @@ impl DegradedMode {
 pub struct RuntimeMeasurements {
     /// Smoothed render frame interval. EMA of `FrameConfig::frame_dt`.
     pub render_dt: Duration,
-    /// Render target the user picked. Reconstructed from
-    /// `OutputRouter::forward_min_interval` source of truth, or set
-    /// directly via `RuntimeGpuBudget::set_user_render_fps`.
-    pub render_target: Duration,
     /// Output drops per second over the most recent measurement window.
     /// `OutputRouter::dropped_count` delta divided by the window.
     pub output_drops_per_sec: f32,
@@ -108,7 +104,6 @@ impl Default for RuntimeMeasurements {
     fn default() -> Self {
         Self {
             render_dt: Duration::from_secs_f32(1.0 / 60.0),
-            render_target: Duration::from_secs_f32(1.0 / 60.0),
             output_drops_per_sec: 0.0,
             export_pool_leased: 0,
             export_pool_capacity: 2,
@@ -370,9 +365,16 @@ impl RuntimeGpuBudget {
     }
 
     fn detect_pressure(&self, m: &RuntimeMeasurements) -> Option<TransitionReason> {
-        let target = m.render_target.as_secs_f32().max(1e-6);
-        let target_fps = 1.0 / target;
-        let render_overrun = m.render_dt.as_secs_f32() > RENDER_OVERRUN_MULTIPLE * target;
+        // Compare against the CURRENT (possibly degraded) target, not the
+        // user's pick. The original comparison used the user target, which
+        // made the pressure ratchet one-way: any machine that can't hold
+        // the user's 60 fps degraded to Heavy (clamp 30), the clamp kept
+        // render_dt above 1.2 × 1/60 s forever, pressure never cleared and
+        // the recovery ladder was dead code — measured 2026-09-25 as a
+        // session-long PressureHeavy stick ("render time exceeded target",
+        // zero transitions after the initial two).
+        let target_fps = self.render_fps_target.max(1) as f32;
+        let render_overrun = m.render_dt.as_secs_f32() > RENDER_OVERRUN_MULTIPLE / target_fps;
         // Mirror image of `render_overrun`: same 1.2× threshold, but
         // measured on the render thread's own production rate. Only
         // fires on a fresh measurement (`Some`), never on "unknown".
@@ -584,19 +586,20 @@ mod tests {
     fn sustained_pressure_escalates_to_heavy_after_dwell() {
         let t0 = Instant::now();
         let mut budget = RuntimeGpuBudget::new(t0);
-        budget.update(&render_overrun_measurements(), t0);
+        // 50 ms dt overruns the Healthy (20 ms), Light (26.7 ms) AND Heavy
+        // (40 ms) thresholds — the escalation needs pressure that SURVIVES
+        // the degraded targets (a 25 ms loop clears at 45 fps and would
+        // recover instead of escalating — see
+        // `pressure_clears_once_the_degraded_target_is_met`).
+        let mut m = render_overrun_measurements();
+        m.render_dt = Duration::from_secs_f32(0.05);
+        budget.update(&m, t0);
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
         // Just under the dwell window: still PressureLight.
-        budget.update(
-            &render_overrun_measurements(),
-            t0 + LIGHT_TO_HEAVY_DWELL - Duration::from_millis(1),
-        );
+        budget.update(&m, t0 + LIGHT_TO_HEAVY_DWELL - Duration::from_millis(1));
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
         // Past the dwell window: escalates.
-        budget.update(
-            &render_overrun_measurements(),
-            t0 + LIGHT_TO_HEAVY_DWELL + Duration::from_millis(1),
-        );
+        budget.update(&m, t0 + LIGHT_TO_HEAVY_DWELL + Duration::from_millis(1));
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
         assert_eq!(budget.render_fps_target(), 30);
     }
@@ -609,14 +612,13 @@ mod tests {
         let t0 = Instant::now();
         let mut budget = RuntimeGpuBudget::new(t0);
         budget.pose_hz_floor = 30;
-        budget.update(&render_overrun_measurements(), t0);
+        let mut m = render_overrun_measurements();
+        m.render_dt = Duration::from_secs_f32(0.05);
+        budget.update(&m, t0);
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
         assert_eq!(budget.pose_hz_target(), 30);
         assert_eq!(budget.depth_refresh_period(), 1);
-        budget.update(
-            &render_overrun_measurements(),
-            t0 + LIGHT_TO_HEAVY_DWELL + Duration::from_millis(1),
-        );
+        budget.update(&m, t0 + LIGHT_TO_HEAVY_DWELL + Duration::from_millis(1));
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
         assert_eq!(budget.pose_hz_target(), 30, "floor holds in Heavy");
         assert_eq!(budget.depth_refresh_period(), 1, "depth stays per-frame");
@@ -640,6 +642,40 @@ mod tests {
             budget.last_transition_reason(),
             TransitionReason::OutputDrops
         );
+    }
+
+    /// Pressure must CLEAR once the loop meets the degraded target —
+    /// regression for the 2026-09-25 one-way ratchet: `detect_pressure`
+    /// compared render_dt against the USER target (60 fps) even after the
+    /// ladder clamped to 30, so any machine below 60 fps sat in
+    /// PressureHeavy forever ("render time exceeded target", zero
+    /// transitions after the initial two, ~36 fps production stuck).
+    #[test]
+    fn pressure_clears_once_the_degraded_target_is_met() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        // 50 ms dt overruns every rung's threshold — sustains into Heavy.
+        let mut bad = render_overrun_measurements();
+        bad.render_dt = Duration::from_secs_f32(0.05);
+        budget.update(&bad, t0);
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
+        budget.update(&bad, t0 + LIGHT_TO_HEAVY_DWELL + Duration::from_millis(1));
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
+        // Now the loop delivers 30 fps (dt 33 ms): 33 < 1.2/30 = 40 ms, so
+        // against the DEGRADED target there is no overrun. The stale
+        // comparison would still read it as overrun (33 > 1.2/60 = 20 ms).
+        let mut ok30 = healthy_measurements();
+        ok30.render_dt = Duration::from_secs_f32(1.0 / 30.0);
+        budget.update(&ok30, t0 + LIGHT_TO_HEAVY_DWELL * 2);
+        // First clean update arms the recovery streak; mode unchanged.
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);
+        // After the recovery dwell of clean frames, Heavy steps down.
+        budget.update(
+            &ok30,
+            t0 + LIGHT_TO_HEAVY_DWELL * 2 + RECOVERY_DWELL + Duration::from_millis(1),
+        );
+        assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
+        assert_eq!(budget.render_fps_target(), 45);
     }
 
     #[test]
@@ -957,20 +993,21 @@ mod tests {
     fn clock_going_backward_does_not_freeze_state_machine() {
         let t0 = Instant::now();
         let mut budget = RuntimeGpuBudget::new(t0);
+        // 50 ms dt keeps pressure alive at every rung (see
+        // `sustained_pressure_escalates_to_heavy_after_dwell`).
+        let mut m = render_overrun_measurements();
+        m.render_dt = Duration::from_secs_f32(0.05);
         // Move into PressureLight and arm pressure_since at t0+5s.
-        budget.update(&render_overrun_measurements(), t0);
-        budget.update(
-            &render_overrun_measurements(),
-            t0 + LIGHT_TO_HEAVY_DWELL / 2,
-        );
+        budget.update(&m, t0);
+        budget.update(&m, t0 + LIGHT_TO_HEAVY_DWELL / 2);
         // Now travel "backward" by calling update with `now = t0` again
         // (simulates a clock adjustment). pressure_since was in the
         // future; the guard must reset it to `now` so dwell can advance.
-        budget.update(&render_overrun_measurements(), t0);
+        budget.update(&m, t0);
         // From this point, advancing forward by the dwell time must
         // reach PressureHeavy as if the backward jump never happened.
         budget.update(
-            &render_overrun_measurements(),
+            &m,
             t0 + LIGHT_TO_HEAVY_DWELL + std::time::Duration::from_millis(1),
         );
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureHeavy);

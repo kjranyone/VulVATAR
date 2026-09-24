@@ -313,6 +313,16 @@ struct ClothGpuSlot {
     normals: Option<ClothGpuNormalResources>,
     collide: Option<ClothGpuCollideResources>,
     selfcol: Option<ClothGpuSelfColResources>,
+    /// Cached-host staging copies of `cloth_pos_ssbo` / `cloth_norm_ssbo`,
+    /// written by a `copy_buffer` recorded at the end of the cloth block
+    /// (the SDF-field pattern). The per-frame readback maps THESE, not the
+    /// SSBOs: the SSBOs are host-visible but BAR-resident, and a mapped
+    /// BAR read measured 5.5 ms/call on the Arc driver (2026-09-25,
+    /// CPU_PROF `cpu_readback`) while the same bytes from cached host
+    /// memory read in well under a millisecond (see the SDF staging fix
+    /// in `sdf_field.rs`).
+    pos_staging: Subbuffer<[[f32; 4]]>,
+    norm_staging: Option<Subbuffer<[[f32; 4]]>>,
 }
 
 /// Per-primitive constraint-projection resources for the Jacobi
@@ -1277,7 +1287,9 @@ impl VulkanRenderer {
         }
 
         // ── Phase 1: Harvest the previous frame's readback ──────────────
+        let prof_start = std::time::Instant::now();
         let harvested = self.harvest_pending_readback()?;
+        let prof_harvest = prof_start.elapsed();
 
         let total_meshes: u32 = input
             .instances
@@ -1300,10 +1312,14 @@ impl VulkanRenderer {
         // control UBOs, morph weights, cloth controls + pins, material
         // uniforms) plus the dispatch structure / shape key. See
         // `frame_plan.rs`.
+        let prof_t = std::time::Instant::now();
         let plan = self.prepare_frame(input)?;
+        let prof_prepare = prof_t.elapsed();
 
         // ── Phase 3: Get or build the frame command buffer ──────────────
+        let prof_t = std::time::Instant::now();
         let command_buffer = self.get_or_build_frame_cb(&plan)?;
+        let prof_cb = prof_t.elapsed();
 
         // GPU cloth readback: harvest (above) already waited the
         // previous frame's fence, so the previous frame's cloth compute
@@ -1313,24 +1329,37 @@ impl VulkanRenderer {
         // and vulkano's usage tracking refuses the CPU map ("resource
         // already in use"), which the live soak observed failing every
         // frame. Attached to whichever result this call returns.
+        let prof_t = std::time::Instant::now();
         let cloth_readback = self.read_cloth_positions();
+        let prof_cloth_rb = prof_t.elapsed();
         // Same one-frame-stale discipline as the cloth readback above
         // (previous frame's fence already waited). Only the instances
         // planned THIS frame map their fields; rows for gated-off
         // instances would ship stale geometry.
+        let prof_t = std::time::Instant::now();
         let sdf_planned = std::mem::take(&mut self.sdf_planned);
         let sdf_fields = sdf_field::read_sdf_fields(&self.sdf_slots, &sdf_planned);
+        let prof_sdf_rb = prof_t.elapsed();
+        let prof_cloth_rb_cells: usize = cloth_readback
+            .iter()
+            .map(|c| c.positions.len() + c.normals.as_ref().map_or(0, |n| n.len()))
+            .sum();
+        let prof_sdf_rb_cells: usize =
+            sdf_fields.iter().map(|f| f.data.len()).sum();
         // Same overwrite discipline as `cloth_readback` above.
         let vbo_audit = self.read_vbo_audit();
+        let prof_readback = prof_cloth_rb + prof_sdf_rb;
 
         crate::tracking::stagelog::mark(self.frame_counter, "render_submit");
         let device = self.device.as_ref().ok_or("renderer: no device")?.clone();
         let queue = self.queue.as_ref().ok_or("renderer: no queue")?.clone();
+        let prof_t = std::time::Instant::now();
         let fence_future = vulkano::sync::now(device.clone())
             .then_execute(queue.clone(), command_buffer)
             .map_err(|e| format!("render: then_execute failed: {e}"))?
             .then_signal_fence_and_flush()
             .map_err(|e| format!("render: fence signal failed: {e}"))?;
+        let prof_submit = prof_t.elapsed();
 
         self.frame_counter += 1;
         let timestamp_nanos = self.frame_counter * 16_666_667u64;
@@ -1402,25 +1431,45 @@ impl VulkanRenderer {
                         // stdout is unreliable behind the dev.ps1
                         // launcher — append to profile/ (gitignored) so
                         // the breakdown survives the session.
-                        if let Ok(mut f) = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("profile/render_prof.log")
-                        {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                f,
-                                "RENDER_PROF compute_prepass={:.2}ms scene={:.2}ms post={:.2}ms readback_copy={:.2}ms total={:.2}ms | clothsim={:.2}ms sdf_splat={:.2}ms rest={:.2}ms (iters=env)",
-                                ms(ticks[0], ticks[1]),
-                                ms(ticks[1], ticks[2]),
-                                ms(ticks[2], ticks[3]),
-                                ms(ticks[3], ticks[4]),
-                                total,
-                                cloth,
-                                sdf,
-                                (total - cloth - sdf).max(0.0),
-                            );
-                        }
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("profile/render_prof.log")
+            {
+                use std::io::Write;
+                let _ = writeln!(
+                    f,
+                    "RENDER_PROF compute_prepass={:.2}ms scene={:.2}ms post={:.2}ms readback_copy={:.2}ms total={:.2}ms | clothsim={:.2}ms sdf_splat={:.2}ms rest={:.2}ms (iters=env)",
+                    ms(ticks[0], ticks[1]),
+                    ms(ticks[1], ticks[2]),
+                    ms(ticks[2], ticks[3]),
+                    ms(ticks[3], ticks[4]),
+                    total,
+                    cloth,
+                    sdf,
+                    (total - cloth - sdf).max(0.0),
+                );
+                let _ = writeln!(
+                    f,
+                    "CPU_PROF harvest_wait={:.2}ms prepare={:.2}ms cb_get={:.2}ms cpu_readback={:.2}ms submit_flush={:.2}ms sum={:.2}ms",
+                    prof_harvest.as_secs_f64() * 1e3,
+                    prof_prepare.as_secs_f64() * 1e3,
+                    prof_cb.as_secs_f64() * 1e3,
+                    prof_readback.as_secs_f64() * 1e3,
+                    prof_submit.as_secs_f64() * 1e3,
+                    (prof_harvest + prof_prepare + prof_cb + prof_readback + prof_submit)
+                        .as_secs_f64()
+                        * 1e3,
+                );
+                let _ = writeln!(
+                    f,
+                    "RB_PROF cloth={:.2}ms ({} cells) sdf={:.2}ms ({} cells)",
+                    prof_cloth_rb.as_secs_f64() * 1e3,
+                    prof_cloth_rb_cells,
+                    prof_sdf_rb.as_secs_f64() * 1e3,
+                    prof_sdf_rb_cells,
+                );
+            }
                     }
                     Err(e) => println!("RENDER_PROF get_results failed: {e:?}"),  // kept on stdout (rare)
                 }

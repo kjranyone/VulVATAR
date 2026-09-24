@@ -27,7 +27,7 @@ use crate::asset::PrimitiveId;
 use crate::renderer::frame_input::{self, RenderFrameInput};
 use crate::renderer::frame_plan::{
     DrawInfo, PlannedCloth, PlannedClothBend, PlannedClothCollide, PlannedClothConstraints, PlannedClothNormal,
-    PlannedClothSelfCol, PlannedInstance, PlannedPrim,
+    PlannedClothReadback, PlannedClothSelfCol, PlannedInstance, PlannedPrim,
 };
 use crate::renderer::pipeline::{self, GpuVertex};
 use crate::renderer::{mat4_cols_identity, VulkanRenderer, TRANSFORM_LOCAL_SIZE};
@@ -944,6 +944,24 @@ impl VulkanRenderer {
                             None
                         };
 
+                        // SSBO → cached-host staging copy pair for the
+                        // per-frame readback (`read_cloth_positions`). The
+                        // GPU slot owns the staging buffers; the copy is
+                        // recorded after the normal pass in the record half.
+                        let readback_plan = self.transform_cache.get(&key).and_then(|slot| {
+                            let gpu = slot.cloth_gpu.as_ref()?;
+                            Some(PlannedClothReadback {
+                                pos_src: slot.cloth_pos_ssbo.clone(),
+                                pos_dst: gpu.pos_staging.clone(),
+                                // Only copy the normals when the normal
+                                // pass actually writes them.
+                                norm_src: gpu.normals.is_some().then(|| slot.cloth_norm_ssbo.clone()),
+                                norm_dst: gpu.normals.is_some().then(|| {
+                                    gpu.norm_staging.clone().expect("norm staging allocated")
+                                }),
+                            })
+                        });
+
                         cloth_plan = Some(PlannedCloth {
                             verlet_set,
                             groups: [groups, 1, 1],
@@ -954,6 +972,7 @@ impl VulkanRenderer {
                             normal: normal_plan,
                             collide: collide_plan,
                             selfcol: selfcol_plan,
+                            readback: readback_plan,
                         });
                         }
                     }
@@ -1468,6 +1487,30 @@ impl VulkanRenderer {
                             builder
                                 .dispatch(cloth.groups)
                                 .map_err(|e| format!("render: cloth normal dispatch: {e}"))?;
+                        }
+                    }
+
+                    // Readback staging copies (SDF-field pattern): after
+                    // the last GPU write of the frame, copy pos/norm into
+                    // cached-host staging so `read_cloth_positions` maps
+                    // cacheable memory instead of round-tripping the BAR
+                    // (5.5 ms/map measured on the Arc driver). Recorded
+                    // unconditionally within the cloth block — the copy
+                    // keeps the staging coherent even on asleep frames.
+                    if let Some(rb) = &cloth.readback {
+                        builder
+                            .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+                                rb.pos_src.clone(),
+                                rb.pos_dst.clone(),
+                            ))
+                            .map_err(|e| format!("render: cloth pos staging copy: {e}"))?;
+                        if let (Some(src), Some(dst)) = (&rb.norm_src, &rb.norm_dst) {
+                            builder
+                                .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+                                    src.clone(),
+                                    dst.clone(),
+                                ))
+                                .map_err(|e| format!("render: cloth norm staging copy: {e}"))?;
                         }
                     }
 

@@ -620,9 +620,6 @@ impl Application {
     /// back to `OutputRouter::set_target_fps` so the throttling gate
     /// honours the budget without any other party knowing about it.
     pub fn update_runtime_gpu_budget(&mut self, now: std::time::Instant) {
-        let user_fps = self.runtime_gpu_budget.user_render_fps().max(1) as f32;
-        let render_target = std::time::Duration::from_secs_f32(1.0 / user_fps);
-
         let elapsed = now
             .saturating_duration_since(self.last_output_drop_sample)
             .as_secs_f32();
@@ -644,7 +641,6 @@ impl Application {
 
         let measurements = crate::app::runtime_gpu_budget::RuntimeMeasurements {
             render_dt: self.render_dt_ema,
-            render_target,
             output_drops_per_sec: drops_per_sec,
             export_pool_leased,
             export_pool_capacity,

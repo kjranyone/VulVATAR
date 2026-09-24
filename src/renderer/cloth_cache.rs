@@ -175,6 +175,17 @@ impl VulkanRenderer {
         )
         .map_err(|e| format!("renderer: cloth verlet descriptor set: {e}"))?;
 
+        // Readback staging in cached host memory — the recorded cloth
+        // block copies SSBO → staging after the normal pass (see
+        // `PlannedClothReadback`), and `read_cloth_positions` maps the
+        // staging one frame stale. Direct SSBO maps measured 5.5 ms/call
+        // (BAR, uncached) on the Arc driver — 2026-09-25.
+        let pos_staging = gpu_alloc::host_cached_read_slice::<[f32; 4]>(
+            &memory_allocator,
+            cloth_pos_ssbo.len() as u64,
+            "cloth pos readback staging",
+        )?;
+
         // ---------- S2.1 — constraint resources (optional) ----------
         let constraints = if !attach.constraints.is_empty() {
             Some(allocate_cloth_constraint_resources(
@@ -198,6 +209,11 @@ impl VulkanRenderer {
             .expect("transform slot exists")
             .cloth_norm_ssbo
             .clone();
+        let norm_staging = gpu_alloc::host_cached_read_slice::<[f32; 4]>(
+            &memory_allocator,
+            cloth_norm_ssbo.len() as u64,
+            "cloth norm readback staging",
+        )?;
         let normals = if !attach.triangle_indices.is_empty() {
             Some(allocate_cloth_normal_resources(
                 &attach.triangle_indices,
@@ -228,6 +244,11 @@ impl VulkanRenderer {
                 normals,
                 collide: None,
                 selfcol: None,
+                pos_staging,
+                // The normal staging is harmless when `normals` is None
+                // (no copy is recorded for it); sizing it to the norm
+                // SSBO unconditionally keeps the slot shape static.
+                norm_staging: Some(norm_staging),
             });
         }
         Ok(())
@@ -639,9 +660,13 @@ impl VulkanRenderer {
     /// Read the previous frame's GPU cloth state (positions + normals)
     /// back to the CPU. Called from `render` after the frame's fence
     /// has been waited (see `RenderResult::cloth_readback`), so the
-    /// host-visible SSBOs read coherently. Slots that never dispatched
-    /// (`version == 0`) are skipped; cost is one mapped read per
-    /// active GPU cloth (~30 KB + ~30 KB at 2.5k particles).
+    /// staging copies (recorded at the end of the cloth block, see
+    /// `PlannedClothReadback`) are complete and the host-visible
+    /// buffers read coherently. Slots that never dispatched
+    /// (`version == 0`) are skipped; the bytes come from cached-host
+    /// staging — mapping the BAR-resident SSBOs directly measured
+    /// 5.5 ms per map on the Arc driver (2026-09-25), which is what the
+    /// staging copies removed.
     pub(crate) fn read_cloth_positions(&mut self) -> Vec<ClothReadback> {
         let mut out = Vec::new();
         for ((mesh_id, primitive_id), slot) in self.transform_cache.iter() {
@@ -651,7 +676,7 @@ impl VulkanRenderer {
             if gpu.state.version == 0 {
                 continue; // allocated but never dispatched
             }
-            let positions = match slot.cloth_pos_ssbo.read() {
+            let positions = match gpu.pos_staging.read() {
                 Ok(guard) => guard.iter().map(|p| [p[0], p[1], p[2]]).collect(),
                 Err(e) => {
                     log::warn!("render: cloth readback (positions) failed: {e}");
@@ -659,9 +684,9 @@ impl VulkanRenderer {
                 }
             };
             let normals = if gpu.normals.is_some() {
-                slot.cloth_norm_ssbo
-                    .read()
-                    .ok()
+                gpu.norm_staging
+                    .as_ref()
+                    .and_then(|staging| staging.read().ok())
                     .map(|guard| guard.iter().map(|n| [n[0], n[1], n[2]]).collect())
             } else {
                 None

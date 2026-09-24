@@ -104,7 +104,7 @@ pub(super) fn ensure_sdf_slot(
             "body SDF field (device)",
         )?;
         let staging =
-            gpu_alloc::host_read_slice::<u32>(memory_allocator, cells, "body SDF staging")?;
+            gpu_alloc::host_cached_read_slice::<u32>(memory_allocator, cells, "body SDF staging")?;
         let set_layout = pipeline
             .layout()
             .set_layouts()
