@@ -1587,9 +1587,15 @@ vec3 closest_point_on_triangle(vec3 p, vec3 a, vec3 b, vec3 c) {
 
 void main() {
     // Triangle decimation: stride 1 = every triangle (the historical
-    // behaviour); stride N samples the surface every N-th triangle, which
-    // the >=10 mm voxel grid cannot distinguish on dense meshes (see
-    // `BodySdfSplatParams::stride_pad`).
+    // behaviour); stride N splats every N-th triangle in full, and
+    // drops a single-centroid point splat for each skipped triangle —
+    // the centroid plugs the surface hole the full splat would have
+    // filled, at ~3 atomicMin per skipped triangle instead of ~90.
+    // Without it the min-field overestimated the surface distance by
+    // enough in dense regions (thigh/waist) that the cloth sdf_contact
+    // stopped pushing and panels sank into the body (2026-09-25, live
+    // rest frame: stranded quad + torn panel; see
+    // `diagnose_sdf_surface_error` for the band numbers).
     uint tri = gl_GlobalInvocationID.x * prm.stride_pad.x;
     if (tri >= prm.dims_tri.w) return;
 
@@ -1626,6 +1632,28 @@ void main() {
                 atomicMin(field.d[cell_idx], floatBitsToUint(dist));
             }
         }
+    }
+
+    // Point splats for the skipped triangles (see the decimation note
+    // above): at the node nearest each skipped triangle's centroid,
+    // write the TRUE node-to-triangle distance — the same value the
+    // full splat would have produced for that (triangle, node) pair.
+    // One closest-point evaluation + 1 atomicMin per skipped triangle,
+    // which restores the surface sampling the stride removed.
+    for (uint k = 1u; k < prm.stride_pad.x; ++k) {
+        uint t2 = tri + k;
+        if (t2 >= prm.dims_tri.w) return;
+        vec3 q0 = verts.v[idx.i[t2 * 3u + 0u]].position.xyz;
+        vec3 q1 = verts.v[idx.i[t2 * 3u + 1u]].position.xyz;
+        vec3 q2 = verts.v[idx.i[t2 * 3u + 2u]].position.xyz;
+        vec3 c = (q0 + q1 + q2) / 3.0;
+        ivec3 cc = ivec3(floor((c - prm.origin_voxel.xyz) / voxel));
+        cc = clamp(cc, ivec3(0), dims - 1);
+        vec3 node = prm.origin_voxel.xyz + vec3(cc) * voxel;
+        float dist = length(node - closest_point_on_triangle(node, q0, q1, q2));
+        if (dist > shell) continue;
+        uint cell_idx = uint(cc.x) + uint(dims.x) * (uint(cc.y) + uint(dims.y) * uint(cc.z));
+        atomicMin(field.d[cell_idx], floatBitsToUint(dist));
     }
 }
 "
