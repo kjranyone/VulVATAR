@@ -7,6 +7,7 @@ pub mod mode_nav;
 pub mod notifications;
 pub mod profile;
 mod project;
+pub mod provisioning;
 mod snapshot;
 pub mod state;
 pub mod status_bar;
@@ -287,6 +288,11 @@ pub struct GuiApp {
     /// management actions); drawn by `top_bar::draw_profile_dialogs`.
     pub(crate) profile_dialog: Option<top_bar::ProfileDialog>,
 
+    /// Startup dependency scan: the pending consent dialog, the
+    /// in-flight resolver, and the list of missing artifacts nothing
+    /// can fetch. See `gui::provisioning`.
+    pub provisioning: provisioning::ProvisioningUiState,
+
     /// Session-only Settings toggle: show the diagnostic status-bar
     /// fields (frame counter, output queue/dropped). Off by default —
     /// they are developer readouts, not streamer-facing signal.
@@ -431,6 +437,14 @@ impl GuiApp {
             pending_file_dialog: None,
             pending_avatar_drop: None,
             profile_dialog: None,
+            // Probe `models/` before the first frame. Cheap (file
+            // existence, plus one `python -c "import …"` only when a
+            // venv interpreter is already on disk), and it has to
+            // happen before the user hits Start Tracking and meets a
+            // blocking error instead of an offer to fix it.
+            provisioning: provisioning::initial_state(
+                app_settings.provisioning_auto_prompt.unwrap_or(true),
+            ),
             debug_status_bar: false,
             debug_panel_hole: None,
 
@@ -452,6 +466,7 @@ impl GuiApp {
                 last_project_path: app_settings.last_project_path.clone(),
                 cloth_gpu_backend: app_settings.cloth_gpu_backend,
                 auto_cloth: app_settings.auto_cloth,
+                provisioning_auto_prompt: app_settings.provisioning_auto_prompt,
             },
 
             mirror_view: false,
@@ -738,6 +753,7 @@ impl GuiApp {
             pending_file_dialog: None,
             pending_avatar_drop: None,
             profile_dialog: None,
+            provisioning: provisioning::ProvisioningUiState::default(),
             debug_status_bar: false,
             debug_panel_hole: None,
 
@@ -1211,6 +1227,9 @@ impl eframe::App for GuiApp {
         self.poll_folder_watcher();
         self.poll_thumbnail_jobs(ctx);
         self.poll_avatar_load_job();
+        // Drain the dependency resolver: toasts on completion, and a
+        // re-scan so the still-missing list stays truthful.
+        provisioning::poll(self);
 
         // Path 1: reconcile GUI-owned settings into Application before
         // running the frame. See the wiring overview above
@@ -1239,6 +1258,7 @@ impl eframe::App for GuiApp {
             self.app.render_thread_fps(),
             self.app.render_submit_drops_total(),
             self.app.render_thread_cpu_ms(),
+            self.app.last_run_frame_ms,
             scene_snapshot,
         );
 
@@ -1260,7 +1280,10 @@ impl eframe::App for GuiApp {
 
             // Path 2: per-frame pipeline inputs ride the FrameConfig.
             let frame_config = self.build_frame_config(frame_dt);
+            let run_frame_t = std::time::Instant::now();
             self.app.run_frame(&frame_config);
+            self.app.last_run_frame_ms =
+                Some(run_frame_t.elapsed().as_secs_f32() * 1e3);
             self.runtime_status.frame_count += 1;
         } else {
             // Paused: drain any in-flight render result anyway so
@@ -1307,6 +1330,11 @@ impl eframe::App for GuiApp {
                     });
                 });
         }
+
+        // Dependency consent / progress. Foreground-ordered like the
+        // other startup modals: a missing detector means tracking cannot
+        // start at all, so this must not hide behind a panel.
+        provisioning::draw(ctx, self);
 
         top_bar::draw(ctx, self);
         mode_nav::draw(ctx, self);

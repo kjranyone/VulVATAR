@@ -183,6 +183,11 @@ pub struct Application {
     /// single-frame visual glitch can be checked against a zero-substep
     /// frame — the frame where the spring solver does not run.
     pub last_sim_substeps: u32,
+    /// Wall time of the most recent `run_frame` in ms (single sample, set
+    /// by the GUI around the call). Published through the heartbeat: with
+    /// the GUI itself the frame pacer, this splits pose/spring/submit
+    /// work from the egui redraw cost.
+    pub last_run_frame_ms: Option<f32>,
     pub editor: EditorSession,
     pub avatars: Vec<AvatarInstance>,
     pub active_avatar_index: usize,
@@ -448,6 +453,7 @@ impl Application {
             render_dt_ema: std::time::Duration::from_secs_f32(1.0 / 60.0),
             sim_clock: SimulationClock::new(1.0 / 60.0, 8),
             last_sim_substeps: 0,
+            last_run_frame_ms: None,
             editor: EditorSession::new(),
             avatars: Vec::new(),
             active_avatar_index: 0,

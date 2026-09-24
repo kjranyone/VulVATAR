@@ -74,6 +74,22 @@ pub(super) struct SplatPrimInput {
     pub tri_count: u32,
 }
 
+/// Triangle decimation stride for the splat dispatch
+/// (`VULVATAR_SDF_SPLAT_STRIDE`, 1 = every triangle). Evaluated once per
+/// process; the value lands in the slot's params UBO, so changing it
+/// requires an avatar reload (or process restart) — acceptable for an
+/// operator A/B knob.
+fn splat_stride() -> u32 {
+    static STRIDE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *STRIDE.get_or_init(|| {
+        std::env::var("VULVATAR_SDF_SPLAT_STRIDE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|v| v.clamp(1, 64))
+            .unwrap_or(1)
+    })
+}
+
 /// Allocate or refresh the instance's splat resources for `grid` and
 /// the primitive list (each entry with its resolved buffers), and
 /// (re)build the per-primitive descriptor sets.
@@ -87,6 +103,7 @@ pub(super) fn ensure_sdf_slot(
     ds_allocator: &Arc<StandardDescriptorSetAllocator>,
     pipeline: &Arc<ComputePipeline>,
 ) -> Result<(), String> {
+    let stride = splat_stride();
     let needs_rebuild = match slots.get(&instance_id) {
         Some(slot) => slot.grid != grid || slot.prim_ids != prim_ids,
         None => true,
@@ -124,6 +141,7 @@ pub(super) fn ensure_sdf_slot(
                         grid.voxel,
                     ],
                     shell_pad: [crate::simulation::sdf::SHELL_METRES, 0.0, 0.0, 0.0],
+                    stride_pad: [stride, 0, 0, 0],
                 },
                 "body SDF splat params",
             )?;
@@ -142,7 +160,7 @@ pub(super) fn ensure_sdf_slot(
             prim_gpu.push(BodySdfPrimGpu {
                 params,
                 set,
-                groups: [(prim.tri_count + 63) / 64, 1, 1],
+                groups: splat_groups(prim.tri_count, stride),
             });
         }
         slots.insert(
@@ -159,16 +177,25 @@ pub(super) fn ensure_sdf_slot(
         // Grid + prim list unchanged; refresh the triangle counts in
         // place (a LOD / subset switch could legally change them while
         // keeping the same primitive identities).
+        let stride = splat_stride();
         for (gpu, prim) in slot.prims.iter_mut().zip(prims.iter()) {
             let mut g = gpu
                 .params
                 .write()
                 .map_err(|e| format!("renderer: body SDF params write: {e}"))?;
             g.dims_tri[3] = prim.tri_count;
-            gpu.groups = [(prim.tri_count + 63) / 64, 1, 1];
+            gpu.groups = splat_groups(prim.tri_count, stride);
         }
     }
     Ok(())
+}
+
+/// Dispatch groups covering `ceil(tri_count / stride)` splat
+/// invocations of 64 threads each (at least one — a zero-group
+/// dispatch is a validation error and stride > tri_count must still
+/// splat triangle 0).
+fn splat_groups(tri_count: u32, stride: u32) -> [u32; 3] {
+    [((tri_count + stride - 1) / stride).div_ceil(64).max(1), 1, 1]
 }
 
 /// Map the (previous frame's) staging copies into CPU memory, for the

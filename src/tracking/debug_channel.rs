@@ -615,6 +615,7 @@ pub fn dump_gui_heartbeat(
     render_fps: Option<f32>,
     render_submit_drops: u64,
     render_cpu_ms: Option<f32>,
+    run_frame_ms: Option<f32>,
     scene: serde_json::Value,
 ) {
     if !enabled() {
@@ -661,6 +662,12 @@ pub fn dump_gui_heartbeat(
         // frame budget while render_fps sags = GPU-bound; small while
         // fps sags = recording path itself is the cost.
         "render_cpu_ms": render_cpu_ms,
+        // Wall time of the last `Application::run_frame` (pose intake +
+        // spring sim + snapshot + submit + drain), EMA-free single
+        // sample. The complement of this against the GUI tick interval
+        // (`1 / gui_fps`) is the egui redraw cost — when the GUI itself
+        // is the frame pacer, this split says which half to attack.
+        "run_frame_ms": run_frame_ms,
         // WHAT is on screen: per-avatar identity (file, primitive
         // counts, cloth slots), camera/output configuration, and the
         // render-thread health counters. Built by

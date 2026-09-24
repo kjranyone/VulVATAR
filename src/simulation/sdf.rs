@@ -61,7 +61,24 @@ const OUTSIDE_VALUE: f32 = SHELL_METRES * 2.0;
 /// keeps its 10 mm voxel WITH the Z lean pad folded in and ~20 % slack
 /// for larger garments (at the old 1.05 M cap the padded grid landed
 /// 2.6 % under and any slightly bigger model fell to 12.5 mm voxels).
+///
+/// `VULVATAR_SDF_MAX_CELLS` overrides for A/B. The splat's atomicMin
+/// stream scales with cell count (and per-triangle coverage), so this
+/// cap is also the GPU-cost dial: the 2026-09-25 live campaign measured
+/// the 1.02 M-cell 10 mm grid costing 15-21 ms/frame of splat — see
+/// `renderer/sdf_field.rs` (`splat_stride`) for the other dial.
 const MAX_CELLS: usize = 1_260_000;
+
+fn max_cells() -> usize {
+    static CELLS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CELLS.get_or_init(|| {
+        std::env::var("VULVATAR_SDF_MAX_CELLS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| *v >= 1000)
+            .unwrap_or(MAX_CELLS)
+    })
+}
 
 /// Candidate voxel sizes (metres), coarse-to-fine search order.
 const VOXEL_CANDIDATES: [f32; 6] = [0.020, 0.016, 0.0125, 0.010, 0.008, 0.006];
@@ -111,7 +128,7 @@ impl SdfGrid {
             let cells = (size[0] / voxel).ceil() as f64
                 * (size[1] / voxel).ceil() as f64
                 * (size[2] / voxel).ceil() as f64;
-            if cells <= MAX_CELLS as f64 {
+            if cells <= max_cells() as f64 {
                 chosen = voxel;
                 break;
             }

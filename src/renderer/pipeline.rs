@@ -1538,6 +1538,9 @@ layout(set = 0, binding = 3) uniform Params {
     vec4 origin_voxel;
     // x = splat shell (metres). The rest pads to 16 B.
     vec4 shell_pad;
+    // x = triangle stride (invocation i splats triangle i*stride);
+    // yzw pad to 16 B.
+    uvec4 stride_pad;
 } prm;
 
 // Cells never written past the shell stay at u32::MAX (filled by the
@@ -1583,7 +1586,11 @@ vec3 closest_point_on_triangle(vec3 p, vec3 a, vec3 b, vec3 c) {
 }
 
 void main() {
-    uint tri = gl_GlobalInvocationID.x;
+    // Triangle decimation: stride 1 = every triangle (the historical
+    // behaviour); stride N samples the surface every N-th triangle, which
+    // the >=10 mm voxel grid cannot distinguish on dense meshes (see
+    // `BodySdfSplatParams::stride_pad`).
+    uint tri = gl_GlobalInvocationID.x * prm.stride_pad.x;
     if (tri >= prm.dims_tri.w) return;
 
     vec3 p0 = verts.v[idx.i[tri * 3u + 0u]].position.xyz;
@@ -3242,6 +3249,15 @@ pub struct BodySdfSplatParams {
     pub origin_voxel: [f32; 4],
     /// x = splat shell in metres; yzw pad to 16 B.
     pub shell_pad: [f32; 4],
+    /// x = triangle stride: invocation i splats triangle `i * stride`,
+    /// so only every stride-th triangle of the (dense) source meshes
+    /// samples the field. The 10 mm voxel grid already quantises the
+    /// surface far coarser than dense-mesh triangle spacing, so the
+    /// redundant atomicMin stream the skipped triangles produced
+    /// measured 15-21 ms/frame of GPU (2026-09-25, RENDER_PROF with
+    /// `VULVATAR_NO_BODY_SDF=1` as the A/B reference) while the field
+    /// contract (shell + sentinel) is unchanged. yzw pad to 16 B.
+    pub stride_pad: [u32; 4],
 }
 
 /// Build the compute pipeline that splats the freshly skinned body
