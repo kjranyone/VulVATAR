@@ -1094,6 +1094,11 @@ fn load_stage_label(stage: &crate::asset::vrm::LoadStage) -> String {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Tick-phase timing for the `debug_gui.json` heartbeat: `tick` is
+        // set at the end of the whole update; the maintenance slice below
+        // is measured in place. Both read as the PREVIOUS tick's values
+        // (the heartbeat is written mid-update) — fine at steady state.
+        let tick_t = std::time::Instant::now();
         // Handle dropped files. Every supported project artefact is
         // accepted, and an unsupported extension gets a toast — a drop
         // that silently does nothing is indistinguishable from a hang.
@@ -1259,6 +1264,8 @@ impl eframe::App for GuiApp {
             self.app.render_submit_drops_total(),
             self.app.render_thread_cpu_ms(),
             self.app.last_run_frame_ms,
+            self.app.last_tick_ms,
+            self.app.last_maint_ms,
             scene_snapshot,
         );
 
@@ -1295,9 +1302,11 @@ impl eframe::App for GuiApp {
 
         // Derive `project_dirty` from an actual state comparison before
         // the autosave reads it — see `refresh_project_dirty`.
+        let maint_t = std::time::Instant::now();
         self.refresh_project_dirty(Instant::now(), false);
         self.autosave_tick();
         self.write_recovery_snapshot_if_due();
+        self.app.last_maint_ms = Some(maint_t.elapsed().as_secs_f32() * 1e3);
 
         // Cloth overlay autosave consent dialog
         if self.app.editor.overlay_asset.is_some()
@@ -1466,6 +1475,7 @@ impl eframe::App for GuiApp {
             // condition the user will already be aware of.
             ctx.request_repaint();
         }
+        self.app.last_tick_ms = Some(tick_t.elapsed().as_secs_f32() * 1e3);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

@@ -605,6 +605,29 @@ pub fn dump_vbo_audit(rows: Vec<VboAuditRow>, timestamp_nanos: u64) {
 /// answer is a value, not an inference.
 ///
 /// No-op unless the debug flag file exists.
+/// Per-phase wall times of one `Application::run_frame`, written to
+/// `debug_framephases.json`. Phase order (see the instrumentation in
+/// `run_frame`): budget+input_update, tracking intake + pose interp,
+/// avatar loop (base pose + physics/springs), frame-input build +
+/// submit, drain_render_results. When `run_frame_ms` in the GUI
+/// heartbeat says the GUI is the frame pacer, this file says WHICH
+/// phase. No-op unless the debug flag file exists.
+pub fn dump_frame_phases(phase_ms: &[f32; 5]) {
+    if !enabled() {
+        return;
+    }
+    let state = serde_json::json!({
+        "input_ms": phase_ms[0],
+        "tracking_ms": phase_ms[1],
+        "avatars_ms": phase_ms[2],
+        "submit_ms": phase_ms[3],
+        "drain_ms": phase_ms[4],
+    });
+    if let Ok(bytes) = serde_json::to_vec(&state) {
+        atomic_write(&base_dir().join("debug_framephases.json"), &bytes);
+    }
+}
+
 pub fn dump_gui_heartbeat(
     paused: bool,
     avatars_loaded: usize,
@@ -616,6 +639,8 @@ pub fn dump_gui_heartbeat(
     render_submit_drops: u64,
     render_cpu_ms: Option<f32>,
     run_frame_ms: Option<f32>,
+    tick_ms: Option<f32>,
+    maint_ms: Option<f32>,
     scene: serde_json::Value,
 ) {
     if !enabled() {
@@ -668,6 +693,12 @@ pub fn dump_gui_heartbeat(
         // (`1 / gui_fps`) is the egui redraw cost — when the GUI itself
         // is the frame pacer, this split says which half to attack.
         "run_frame_ms": run_frame_ms,
+        // Whole GUI tick (`GuiApp::update`) wall time and its
+        // maintenance slice (project-dirty derivation + autosave +
+        // recovery snapshot). `tick − run_frame − maintenance` ≈ egui
+        // redraw + panels + heartbeat — the GUI-side pacer split.
+        "tick_ms": tick_ms,
+        "maint_ms": maint_ms,
         // WHAT is on screen: per-avatar identity (file, primitive
         // counts, cloth slots), camera/output configuration, and the
         // render-thread health counters. Built by

@@ -48,6 +48,14 @@ impl Application {
 
         self.update_render_dt_ema(frame_dt);
         self.update_runtime_gpu_budget(std::time::Instant::now());
+        // Phase wall-times for the `debug_framephases.json` heartbeat —
+        // when the GUI is the frame pacer, this says which run_frame
+        // phase eats the budget. Phases: [0] budget+input_update,
+        // [1] tracking intake + pose interp, [2] avatar loop (base pose
+        // + springs/physics), [3] frame-input build + submit,
+        // [4] drain_render_results.
+        let mut phase_ms = [0.0f32; 5];
+        let phase_t = std::time::Instant::now();
 
         // Background animation clock. Wrapped at 4096 s (≈68 min) so the f32
         // handed to the shader keeps sub-millisecond precision; the wrap is a
@@ -58,6 +66,8 @@ impl Application {
 
         // 1. input update
         self.input_update(frame_dt);
+        phase_ms[0] = phase_t.elapsed().as_secs_f32() * 1e3;
+        let phase_t = std::time::Instant::now();
 
         // 2. read the latest completed tracking sample from the async
         //    tracking worker. Three age states:
@@ -183,6 +193,8 @@ impl Application {
             let delta = (fade_target - self.tracking_fade_opacity).clamp(-max_step, max_step);
             self.tracking_fade_opacity = (self.tracking_fade_opacity + delta).clamp(0.0, 1.0);
         }
+        phase_ms[1] = phase_t.elapsed().as_secs_f32() * 1e3;
+        let phase_t = std::time::Instant::now();
 
         let retarget_params = crate::avatar::retarget::RetargetParams {
             rotation_blend: smoothing_params.rotation_blend,
@@ -461,6 +473,8 @@ impl Application {
                 );
             }
         }
+        phase_ms[2] = phase_t.elapsed().as_secs_f32() * 1e3;
+        let phase_t = std::time::Instant::now();
 
         if !self.avatars.is_empty() {
             let output_extent = self.output_extent.unwrap_or(self.viewport_extent);
@@ -591,6 +605,8 @@ impl Application {
                 }
             }
         }
+        phase_ms[3] = phase_t.elapsed().as_secs_f32() * 1e3;
+        let phase_t = std::time::Instant::now();
 
         // Drain results unconditionally — outside the `!avatars.is_empty()`
         // gate above and meant to be called even when the GUI is paused
@@ -599,6 +615,8 @@ impl Application {
         // the user pauses or removes the last avatar with a frame still
         // in flight, and the GUI repaint gate would loop forever.
         self.drain_render_results();
+        phase_ms[4] = phase_t.elapsed().as_secs_f32() * 1e3;
+        crate::tracking::debug_channel::dump_frame_phases(&phase_ms);
     }
 
     fn update_render_dt_ema(&mut self, frame_dt: f32) {
@@ -639,6 +657,19 @@ impl Application {
             .map(|p| (p.leased_slots, p.capacity))
             .unwrap_or((0, 0));
 
+        // GUI→render command-channel rejection rate over the same window
+        // as `drops_per_sec` — the starvation corroborator (see
+        // `RuntimeMeasurements::submit_drops_per_sec`).
+        let current_submit_drops = self.render_submit_drops_total();
+        let submit_drops_per_sec = if elapsed >= 0.5 {
+            let delta =
+                current_submit_drops.saturating_sub(self.last_submit_drop_count) as f32;
+            (delta / elapsed).max(0.0)
+        } else {
+            0.0
+        };
+        self.last_submit_drop_count = current_submit_drops;
+
         let measurements = crate::app::runtime_gpu_budget::RuntimeMeasurements {
             render_dt: self.render_dt_ema,
             output_drops_per_sec: drops_per_sec,
@@ -657,6 +688,7 @@ impl Application {
             // on `render_results_pending`), so `render_dt` stays small
             // and only this measurement sees the shortfall.
             render_fps: self.render_thread_fps(),
+            submit_drops_per_sec,
         };
         self.runtime_gpu_budget.update(&measurements, now);
 

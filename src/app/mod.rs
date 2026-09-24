@@ -173,6 +173,10 @@ pub struct Application {
     /// drops-per-sec measurement rather than a raw counter.
     last_output_drop_count: u64,
     last_output_drop_sample: std::time::Instant,
+    /// Previous cumulative GUI→render command rejections — the delta
+    /// feeds `RuntimeMeasurements::submit_drops_per_sec` (the starvation
+    /// corroborator).
+    last_submit_drop_count: u64,
     /// Smoothed render frame interval (EMA of `FrameConfig::frame_dt`).
     /// Initialised to the 60 fps target; updated each call to
     /// [`Self::run_frame`].
@@ -188,6 +192,13 @@ pub struct Application {
     /// the GUI itself the frame pacer, this splits pose/spring/submit
     /// work from the egui redraw cost.
     pub last_run_frame_ms: Option<f32>,
+    /// Wall time of the most recent GUI tick (whole `update`) in ms, and
+    /// the maintenance slice of it (project-dirty derivation + autosave +
+    /// recovery snapshot). `tick − run_frame − maintenance` ≈ egui redraw
+    /// + panels — the split that says which half to attack when the GUI
+    /// is the frame pacer.
+    pub last_tick_ms: Option<f32>,
+    pub last_maint_ms: Option<f32>,
     pub editor: EditorSession,
     pub avatars: Vec<AvatarInstance>,
     pub active_avatar_index: usize,
@@ -450,10 +461,13 @@ impl Application {
             runtime_gpu_budget: runtime_gpu_budget::RuntimeGpuBudget::new(now),
             last_output_drop_count: 0,
             last_output_drop_sample: now,
+            last_submit_drop_count: 0,
             render_dt_ema: std::time::Duration::from_secs_f32(1.0 / 60.0),
             sim_clock: SimulationClock::new(1.0 / 60.0, 8),
             last_sim_substeps: 0,
             last_run_frame_ms: None,
+            last_tick_ms: None,
+            last_maint_ms: None,
             editor: EditorSession::new(),
             avatars: Vec::new(),
             active_avatar_index: 0,

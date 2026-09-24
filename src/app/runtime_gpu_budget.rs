@@ -98,6 +98,14 @@ pub struct RuntimeMeasurements {
     /// invisible to `render_dt` — while the production rate sags below
     /// the user's target.
     pub render_fps: Option<f32>,
+    /// GUI→render command-channel drop rate (per second) over the
+    /// measurement window — `render_submit_drops` delta. STARVATION
+    /// evidence: a renderer paced by its input (GUI tick == render rate)
+    /// sits below the fps threshold without any drops, and counting that
+    /// as pressure made the ladder oscillate around a matched-pace
+    /// ~45 fps forever. Pressure only when the GUI is trying to send
+    /// faster than the render thread drains (drops climbing).
+    pub submit_drops_per_sec: f32,
 }
 
 impl Default for RuntimeMeasurements {
@@ -109,6 +117,7 @@ impl Default for RuntimeMeasurements {
             export_pool_capacity: 2,
             gpu_export_failures_this_tick: 0,
             render_fps: None,
+            submit_drops_per_sec: 0.0,
         }
     }
 }
@@ -192,6 +201,11 @@ const RECOVERY_DWELL: Duration = Duration::from_secs(30);
 const HEAVY_DROP_RATE_PER_SEC: f32 = 20.0;
 const LIGHT_DROP_RATE_PER_SEC: f32 = 5.0;
 const RENDER_OVERRUN_MULTIPLE: f32 = 1.2;
+/// Submit-drop rate that counts as the GUI actually being throttled by a
+/// slow renderer. One rejected command per second is noise (GUI bursts);
+/// sustained rejections are the starvation the fps threshold needs as
+/// corroboration.
+const STARVED_DROP_RATE_PER_SEC: f32 = 1.0;
 /// Failures within this rolling window count toward the
 /// `PressureHeavy → EmergencyCpu` escalation.
 const FAILURE_WINDOW: Duration = Duration::from_secs(10);
@@ -376,11 +390,16 @@ impl RuntimeGpuBudget {
         let target_fps = self.render_fps_target.max(1) as f32;
         let render_overrun = m.render_dt.as_secs_f32() > RENDER_OVERRUN_MULTIPLE / target_fps;
         // Mirror image of `render_overrun`: same 1.2× threshold, but
-        // measured on the render thread's own production rate. Only
-        // fires on a fresh measurement (`Some`), never on "unknown".
+        // measured on the render thread's own production rate — and only
+        // when the GUI is actually being rejected (submit drops
+        // climbing). A renderer paced by its input (GUI tick == render
+        // fps) sits below the threshold with zero drops; counting it as
+        // pressure made the ladder flap around ~45 fps forever
+        // (2026-09-25 live: render_fps 42-60 swinging with the mode).
         let render_starved = m
             .render_fps
-            .is_some_and(|fps| fps < target_fps / RENDER_OVERRUN_MULTIPLE);
+            .is_some_and(|fps| fps < target_fps / RENDER_OVERRUN_MULTIPLE)
+            && m.submit_drops_per_sec > STARVED_DROP_RATE_PER_SEC;
         let high_drops = m.output_drops_per_sec > LIGHT_DROP_RATE_PER_SEC;
         let pool_saturated =
             m.export_pool_capacity > 0 && m.export_pool_leased >= m.export_pool_capacity;
@@ -498,16 +517,17 @@ mod tests {
 
     /// Target 60 fps → starvation threshold 60/1.2 = 50 fps. A render
     /// thread producing 30 fps (the sustained "command queue full" log
-    /// scenario) must count as pressure even though the GUI tick EMA
-    /// (`render_dt`) looks perfectly healthy — the GUI keeps ticking
-    /// under backpressure, which is exactly what `render_dt` cannot
-    /// see through.
+    /// scenario) counts as pressure only when the GUI is actually being
+    /// rejected (submit drops climbing) — a matched-pace GUI at 30 fps
+    /// with zero drops is healthy backpressure (see
+    /// `matched_pace_below_threshold_is_not_pressure`).
     #[test]
     fn render_thread_starvation_is_a_pressure_signal() {
         let t0 = Instant::now();
         let mut budget = RuntimeGpuBudget::new(t0);
         let mut m = healthy_measurements();
         m.render_fps = Some(30.0);
+        m.submit_drops_per_sec = 10.0;
         budget.update(&m, t0 + Duration::from_millis(16));
         assert_eq!(budget.degraded_mode(), DegradedMode::PressureLight);
         assert_eq!(
@@ -526,6 +546,21 @@ mod tests {
         let mut budget = RuntimeGpuBudget::new(t0);
         let mut m = healthy_measurements();
         m.render_fps = Some(60.0 / RENDER_OVERRUN_MULTIPLE);
+        m.submit_drops_per_sec = 10.0;
+        budget.update(&m, t0 + Duration::from_millis(16));
+        assert_eq!(budget.degraded_mode(), DegradedMode::Healthy);
+    }
+
+    /// Below-threshold fps WITHOUT submit drops is matched pace — the
+    /// GUI paces itself to the renderer, nobody is rejected, and the
+    /// ladder must stay Healthy. This is the 2026-09-25 live signature
+    /// (render_fps 42-60 swinging with the mode at zero genuine load).
+    #[test]
+    fn matched_pace_below_threshold_is_not_pressure() {
+        let t0 = Instant::now();
+        let mut budget = RuntimeGpuBudget::new(t0);
+        let mut m = healthy_measurements();
+        m.render_fps = Some(43.0);
         budget.update(&m, t0 + Duration::from_millis(16));
         assert_eq!(budget.degraded_mode(), DegradedMode::Healthy);
     }
