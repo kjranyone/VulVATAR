@@ -233,6 +233,33 @@ will invalidate that cache and trigger a rebuild.
 - 顔 sidecar の interpreter 優先順位は env (`VULVATAR_FACE_SIDECAR_PYTHON`) >
   `tools/face98-venv` > PATH の裸 `python`。真ん中が無いと、アプリ内解決で venv を
   作ったユーザーが PATH の python を掴み、litert 不在で毎フレーム respawn する。
+- **refiner 3 本が無い状態の実測ベースライン (2026-09-28)**。presence/palm/blendshape が
+  欠けたままでも hand チェーンは起動する (必須は landmark 1 本だけ) が、**コストが跳ねる**。
+  同一録画 `s1789246660` (782f) の `phase hands`:
+
+  | 構成 | mean | med | p90 | max | >33ms の割合 |
+  |---|---|---|---|---|---|
+  | MediaPipe hand 時代 (2026-09-16 実測) | 5.6ms | 7.0 | 7.6 | 12.2 | **0%** |
+  | RTMPose + refiner 無し (今) | **69.6ms** | 60.0 | 103.3 | 595.7 | **92%** |
+
+  3 録画の横断 (`diagnostics/fusion/refinerless_*`、再現は `diagnose_fusion_replay`):
+
+  | session | hand crops L/R | phase hands mean | L snaps | R snaps |
+  |---|---|---|---|---|
+  | s1789246274 (= AGENTS の chin、L436/R0 とほぼ一致) | 434 / 0 | 29.8ms | 0 | 0 |
+  | s1789242856 | 57 / 104 | 38.6ms | 1 | **12** |
+  | s1789246660 | 49 / 223 | 69.6ms | 4 | **17** |
+
+  読み方: **コストは「手を掴めているか」と逆相関する** — chin のようにロックできる録画は
+  29.8ms、掴み損ねる録画は 69.6ms。AGENTS.md が「候補全 Fail フレームで 50-70ms、
+  ライブ 30Hz で要観測」と書いた**最悪ケースが平常ケースになっている**。R snaps 12-17 も
+  rt42 の目標 0 から後退 (chin の duty も 0.90 → 0.71)。
+  **機序は推論であって未実測**: presence net が presence の唯一の権威で、無いと
+  SimCC sharpness proxy に落ちる。この proxy は AGENTS.md の実測で**正しさと逆相関**
+  (幻覚 0.80 vs 真の手 0.52) なので候補が落ちやすく、全 Fail ラダーを踏む頻度が上がる、
+  という筋書き。**presence net を戻せばコストが戻る保証は測っていない**。
+  したがって refiner の再学習は「品質の詰め」ではなく **30fps を守るための前提**として
+  評価すべき。再学習したら同じ 3 本でこの表を作り直して比較すること。
 - **フォントもマニフェスト管理下** (`cjk_fonts` / `icon_font`, 2026-09-28)。`assets/` は
   gitignore で otf/ttf は未追跡なので、fresh checkout は CJK が豆腐・アイコンが空白に
   なる。そして旧警告は「dev.ps1 Install-Font を実行」— **UI が読めない人間に読ませる
