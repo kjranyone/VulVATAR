@@ -191,6 +191,18 @@ will invalidate that cache and trigger a rebuild.
   `/scratchpad/` `/datasets/` がどちらも gitignore のため**一度も git に入っておらず
   履歴からも復元できない**。無くても quality 低下 (presence は SimCC sharpness
   proxy、acquisition は heuristic crop) で、起動は阻害しない。
+- **hand モデルの取得元が dev.ps1 と Rust で違う** (2026-09-28 時点): dev.ps1 は
+  HF の第三者ミラー (`DavidPagnon/rtmlib_models` の素の .onnx)、Rust マニフェストは
+  公式 `download.openmmlab.com` の mmdeploy zip。どちらも 200 で同じモデルだが、
+  **契約検証を通したのは公式 zip 側だけ**。片方を変えるときは両方見ること。
+- `Install-DirectFiles` / `Install-ZipArchive` は 7e30579 の dead-code sweep で
+  **定義だけ消され呼び出しが残り**、`Install-Models` が
+  「'Install-DirectFiles' は認識されません」で全 run エントリごと落ちていた
+  (2026-09-24〜28)。`Install-DirectFiles` は復元済み (`.part` ステージング付き —
+  旧実装は失敗時に切り詰めファイルを最終名で残し、次回 "already installed" で
+  skip されていた)。`Install-ZipArchive` は現在呼び出し元が無いので復元していない。
+  **dev.ps1 から関数を消すときは呼び出し側を grep すること** — PowerShell は
+  実行時にしか気付かない。
 - **マニフェストの URL は必ず 1 行で書く**。`\` 継続の文字列リテラルは rustfmt が
   1 行に畳む際に**インデントを文字列の中に残す**ことがあり、curl が
   `URL rejected: Malformed input to a URL function` で落ちる (実測)。

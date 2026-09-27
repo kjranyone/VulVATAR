@@ -150,6 +150,46 @@ function Install-Models {
     Write-Host "VulVATAR ONNX models installed successfully." -ForegroundColor Green
 }
 
+# Download each `@{ Url; OutName }` into models\, skipping what is
+# already there.
+#
+# Restored 2026-09-28: the dead-code sweep in 7e30579 deleted this
+# function together with the RTMW3D/YOLOX callers, but left the face
+# sidecar's call standing, so `Install-Models` — which every run menu
+# entry calls first — died with "'Install-DirectFiles' は認識されません"
+# and no model was ever fetched.
+#
+# Each transfer lands on `<dest>.part` and is renamed only after curl
+# succeeds. The pre-sweep version wrote straight to the final name, so an
+# interrupted download left a truncated file that the next run would
+# "skip, already installed" and the runtime would then fail to parse.
+# The in-app resolver (src\provisioning) stages the same way.
+function Install-DirectFiles {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [array]$Files
+    )
+
+    Write-Host "  Fetching ${Name}..." -ForegroundColor Cyan
+    foreach ($f in $Files) {
+        $dest = Join-Path "models" $f.OutName
+        if (Test-Path $dest) {
+            Write-Host "    $($f.OutName): already installed, skipping" -ForegroundColor Green
+            continue
+        }
+        $part = "$dest.part"
+        if (Test-Path $part) { Remove-Item $part -Force }
+        Write-Host "    downloading $($f.Url)" -ForegroundColor DarkGray
+        & curl.exe --fail --silent --show-error --location $f.Url -o $part
+        if ($LASTEXITCODE -ne 0) {
+            if (Test-Path $part) { Remove-Item $part -Force }
+            throw "curl download failed for $($f.OutName) (exit $LASTEXITCODE): $($f.Url)"
+        }
+        Move-Item $part $dest -Force
+        Write-Host "    kept $($f.OutName)" -ForegroundColor Green
+    }
+}
+
 #region Face sidecar & YOLO26 export
 # Interpreter path of the face-sidecar venv. Install-FaceSidecarEnv
 # provisions it; the run menu entries export it as
