@@ -28,6 +28,7 @@ fn app_settings_roundtrip() {
         camera_serial: Some("1234567890".to_string()),
         cloth_gpu_backend: Some(true),
         auto_cloth: Some(false),
+        provisioning_auto_prompt: Some(false),
     };
     save_app_settings_to(&original, &path).expect("save");
     let loaded = load_app_settings_from(&path).expect("load");
@@ -42,6 +43,9 @@ fn app_settings_roundtrip() {
     );
     assert_eq!(loaded.camera_serial.as_deref(), Some("1234567890"));
     assert_eq!(loaded.cloth_gpu_backend, Some(true));
+    // "Don't ask again" has to survive a restart, or the startup
+    // dependency prompt would reappear every launch.
+    assert_eq!(loaded.provisioning_auto_prompt, Some(false));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

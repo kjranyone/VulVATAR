@@ -87,6 +87,15 @@ pub struct AppSettings {
     /// `Application::set_auto_cloth_enabled` at startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_cloth: Option<bool>,
+    /// Whether the startup dependency scan may raise its consent
+    /// dialog. `None`/`Some(true)` = ask whenever something resolvable
+    /// is missing; `Some(false)` = the user chose "don't ask again".
+    ///
+    /// Only the *prompt* is suppressed — the scan still runs, because
+    /// the missing-but-unresolvable list is what explains a degraded
+    /// face/hand chain to anyone who later asks why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provisioning_auto_prompt: Option<bool>,
 }
 
 fn default_app_settings_version() -> u32 {
@@ -106,6 +115,7 @@ impl Default for AppSettings {
             camera_serial: None,
             cloth_gpu_backend: None,
             auto_cloth: None,
+            provisioning_auto_prompt: None,
         }
     }
 }
@@ -179,6 +189,7 @@ pub(super) fn migrate_legacy_app_settings_from(path: &Path) -> Option<AppSetting
         camera_serial: None,
         // And predate the cloth backend preference — env decides.
         auto_cloth: None,
+        provisioning_auto_prompt: None,
         cloth_gpu_backend: None,
     })
 }

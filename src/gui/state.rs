@@ -440,6 +440,9 @@ pub struct SettingsGuiState {
     pub cloth_gpu_backend: Option<bool>,
     /// Mirror of [`crate::persistence::AppSettings::auto_cloth`].
     pub auto_cloth: Option<bool>,
+    /// Mirror of
+    /// [`crate::persistence::AppSettings::provisioning_auto_prompt`].
+    pub provisioning_auto_prompt: Option<bool>,
 }
 
 impl Default for SettingsGuiState {
@@ -452,6 +455,7 @@ impl Default for SettingsGuiState {
             last_project_path: None,
             cloth_gpu_backend: None,
             auto_cloth: None,
+            provisioning_auto_prompt: None,
         }
     }
 }

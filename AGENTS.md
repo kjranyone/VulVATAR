@@ -155,6 +155,82 @@ will invalidate that cache and trigger a rebuild.
   `simulation/tests.rs` / `cloth_solver/tests.rs` / `app/render.rs` の各
   テストモジュール。
 
+## Dependency provisioning (models/ を誰が用意するか)
+
+- **アプリ内の依存解決 (`src/provisioning/`, 2026-09-23)**: 起動時 (`GuiApp::new`) に
+  `provisioning::scan(".")` が全ランタイム依存を probe し、不足があれば同意ダイアログ
+  (`src/gui/provisioning.rs`) を出す。承諾すると `ProvisionJob` がワーカースレッドで
+  解決する。**マニフェスト (`provisioning::manifest()`) が Rust 側の唯一の真実** —
+  URL・ファイル名・probe を一箇所に持つ。`dev.ps1` は別コピーを持ち続ける
+  (インストーラが dev.ps1 を同梱しないので、アプリから委譲できない)。
+- 解決手段は 3 種で、**UI は決して混ぜない**:
+  (1) `Download` = `curl.exe` (Windows 10 1803+ 同梱、dev.ps1 と同じ手段。Rust の
+  HTTP/TLS クレートは入れない)。`<dest>.part` に落として成功時のみ rename —
+  途中まで落ちたモデルが probe を満たして onnxruntime の奥で死ぬのを防ぐ。
+  (2) `PythonVenv` / `UltralyticsExport` = python/pip 必須。検出器の export は
+  torch ~2.5GB なので同意なしには絶対に始めない。
+  (3) `DownloadZip` = mmdeploy 形式の zip。展開は **System32 の `tar.exe`
+  (bsdtar)** — curl.exe の隣にあり zip を読める。**PATH の裸 `tar.exe` は使わない**:
+  開発シェルでは GNU tar が先に来ることがあり、GNU tar は zip を読めない
+  (`This does not look like a tar archive`、実測)。
+  (4) `Manual` = 蒸留物 (hand presence/palm, blendshape MLP)。**取得手段が存在しない**
+  ので、ボタンを出さずにその旨と再学習手順の場所だけ出す。旧 `error_model_warning`
+  が「./dev.ps1 setup を実行」と案内していたのは誤り (dev.ps1 も取得できない) —
+  4 言語とも文言修正済み。
+- **hand は 3 本のうち 1 本だけが必須で、それは DL できる (2026-09-27)**。
+  `RtmposeHand` は presence/palm を `Option` で持ち、`rtmpose-m-hand_256.onnx` が
+  無い時だけ `Ok(None)` → 「hand チェーンが起動しない」になる。この 1 本は mmpose が
+  mmdeploy バンドルで公開している (`rtmposev1/onnx_sdk/rtmpose-m_simcc-hand5_...zip`、
+  51MB、中身 `end2end.onnx` 55MB) ので `DownloadZip` で自動取得する。
+  **契約はバンドルのメタデータではなく実グラフで確認した** — `detail.json` は
+  `input_shape: [192,256]` と書いているが、ONNX は `(batch,3,256,256)` →
+  `simcc_x/simcc_y (batch,21,512)` で `fusion/hands.rs` の契約 (512 bins = 入力の 2 倍、
+  ImageNet 正規化) に一致する。回帰は `HandBackend::try_from_models_dir` に実物を
+  食わせる end-to-end テストで固定 (メタデータを信じると 192×256 で壊す)。
+  presence/palm/blendshape MLP は依然 `Manual`: 学習スクリプトは
+  `/scratchpad/` `/datasets/` がどちらも gitignore のため**一度も git に入っておらず
+  履歴からも復元できない**。無くても quality 低下 (presence は SimCC sharpness
+  proxy、acquisition は heuristic crop) で、起動は阻害しない。
+- **マニフェストの URL は必ず 1 行で書く**。`\` 継続の文字列リテラルは rustfmt が
+  1 行に畳む際に**インデントを文字列の中に残す**ことがあり、curl が
+  `URL rejected: Malformed input to a URL function` で落ちる (実測)。
+  不変条件はテスト `manifest_urls_are_clean` で固定。
+- **python interpreter の判定は exit code では不可**。この開発機の conda python は
+  `--version` に `Python 3.12.9` と答え、`-c` では
+  `Fatal Python error: init_fs_encoding` を吐きながら **exit 0 を返す** (実測)。
+  健全な `py -3` を黙って隠していた。`find_interpreter` / `venv_imports_ok` は
+  **stdout に marker (`VULVATAR_PY_OK`) が出ることを要求**する。exit status だけを
+  信じると、scan が死んだ venv を「provisioned」と判定し sidecar が毎フレーム
+  respawn する。
+- 子プロセスは全て `CREATE_NO_WINDOW`。console subsystem バイナリなので、付けないと
+  pip がライブ配信の上にコンソールを開く。
+- **`ProvisionJob::spawn` は root を絶対パス化する**。export は `current_dir(root)` で
+  子を回すため、相対 root だと自分の中でもう一度解決され、ultralytics が
+  「checkpoint が無い」と判断して**黙ってネットから別の .pt を落として成功を返す**
+  (実測。テストで検出した)。`canonicalize` は使わない — Windows では `\\?\` 付きの
+  extended-length path が返り、ultralytics のパス解析が弾く
+  (`acceptable suffix is {'.pt'}, not .//`、これも実測)。
+- ultralytics venv は `tools/yolo-export-venv` が正。dev.ps1 も同じ場所を使うように
+  変更済みで、どちらも旧 `%TEMP%\yolo_export_venv` があれば再利用する (torch を
+  二度落とさないため)。`%TEMP%` を正にしないのはディスククリーンアップで消えるから。
+- 顔 sidecar の interpreter 優先順位は env (`VULVATAR_FACE_SIDECAR_PYTHON`) >
+  `tools/face98-venv` > PATH の裸 `python`。真ん中が無いと、アプリ内解決で venv を
+  作ったユーザーが PATH の python を掴み、litert 不在で毎フレーム respawn する。
+- `settings.json` の `provisioning_auto_prompt: false` で起動時ダイアログを止められる
+  (scan 自体は走り続ける — 「なぜ手が追えないか」の答えに要る)。
+- 検証: ユニットは `cargo test --lib provisioning` (23件)。**実ネットワーク/実 python の
+  end-to-end は `tests/provisioning_fetch.rs` (`--ignored`)** — DL・キャンセル後始末・
+  venv 新規作成・検出器 export・hand モデル DL+`HandBackend` ロードの 5 本。
+  `job.rs` を触ったら必ず回す (root 二重解決・`\\?\` 拒否・URL 空白混入・
+  exit-0 な壊れ interpreter は**いずれもユニットテストでは出ず、これで出た**):
+  ```powershell
+  cargo test --test provisioning_fetch -- --ignored --nocapture --test-threads 1
+  ```
+- インストーラ (`installer/vulvatar.iss`) は `yolo26n-pose_480.onnx` を同梱する。
+  **これが無いと導入環境は「YOLO26-pose model not found」で何もできない** (2026-09-23
+  まで同梱漏れ)。リリースビルド前に export を済ませておくこと。hand の必須 1 本は
+  導入環境でもアプリ内解決で DL できるので同梱は任意 (presence/palm は同梱のみ)。
+
 ## Tracking (fusion estimator)
 
 - 本番プロバイダは `FusionProvider` (`src/tracking/fusion/provider.rs`) の一本のみ。ファクトリは `create_pose_provider` (`src/tracking/provider.rs`、`inference` feature 経由)。現行仕様は `docs/tracking-v2-design.md` (As-Is のみ、経緯は書かない)。

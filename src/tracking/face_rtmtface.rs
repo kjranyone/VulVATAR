@@ -267,8 +267,22 @@ impl FaceRtmpose {
             );
             None
         };
-        let python = std::env::var("VULVATAR_FACE_SIDECAR_PYTHON")
-            .unwrap_or_else(|_| "python".to_string());
+        // Interpreter precedence: explicit env (what `dev.ps1`'s run
+        // entries export) > the venv the in-app dependency resolver
+        // provisions > bare `python` off PATH.
+        //
+        // The middle step matters: without it a user who accepted the
+        // startup prompt would still get the PATH interpreter, which
+        // has no `ai_edge_litert`, and the sidecar would die and
+        // respawn once per frame.
+        let python = std::env::var("VULVATAR_FACE_SIDECAR_PYTHON").unwrap_or_else(|_| {
+            let provisioned = PathBuf::from(crate::provisioning::FACE_SIDECAR_PYTHON);
+            if provisioned.is_file() {
+                provisioned.to_string_lossy().into_owned()
+            } else {
+                "python".to_string()
+            }
+        });
         let script = std::env::var("VULVATAR_FACE_SIDECAR_SCRIPT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("scripts/face98_service.py"));

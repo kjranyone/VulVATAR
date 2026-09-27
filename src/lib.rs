@@ -10,6 +10,7 @@ pub mod lipsync;
 pub mod math_utils;
 pub mod output;
 pub mod persistence;
+pub mod provisioning;
 pub mod renderer;
 pub mod simulation;
 pub mod single_instance;

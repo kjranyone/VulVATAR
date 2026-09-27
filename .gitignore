@@ -83,3 +83,13 @@ models/*.npy
 models/*.bak
 models/*.json
 models/*bak
+
+# ...except the face sidecar's correspondence data, which is tracked
+# (it was force-added past these patterns). Both files are generated
+# offline by scratchpad/build_face98_mapping.py from the WFLW test
+# split, but together they are under 50 KB, nothing hosts them, and
+# `face_rtmtface` refuses to start without them — so a fresh clone must
+# carry them. Spelling that out here keeps the next `git add models/`
+# from silently dropping them again.
+!models/mp_canonical478.npy
+!models/mp_wflw98_idx.json

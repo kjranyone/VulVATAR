@@ -93,6 +93,13 @@ Source: "..\assets\MaterialSymbolsRounded.ttf"; DestDir: "{app}\assets";        
 ; ai-edge-litert on PATH (VULVATAR_FACE_SIDECAR_PYTHON) — bundling an
 ; interpreter is not solved yet, so installed builds fall back to
 ; "expressions disabled" with a warning when no python exists.
+; The body detector — the file tracking actually loads
+; (src\tracking\detector\yolo26.rs). Without it the worker reports a
+; blocking "YOLO26-pose model not found" and the install does nothing
+; at all. It is an ONNX export of the repo's yolo26n-pose.pt, so a
+; release build must first run dev.ps1's "export yolo26-pose ONNX"
+; entry (or accept the app's own dependency prompt).
+Source: "..\models\yolo26n-pose_480.onnx";      DestDir: "{app}\models";         Flags: ignoreversion
 Source: "..\models\rtm_face_fp16.tflite";       DestDir: "{app}\models";         Flags: ignoreversion
 Source: "..\models\mp_canonical478.npy";        DestDir: "{app}\models";         Flags: ignoreversion
 Source: "..\models\mp_wflw98_idx.json";         DestDir: "{app}\models";         Flags: ignoreversion

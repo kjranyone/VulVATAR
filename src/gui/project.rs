@@ -222,6 +222,7 @@ impl GuiApp {
             camera_serial: self.tracking.camera_serial.clone(),
             cloth_gpu_backend: self.settings.cloth_gpu_backend,
             auto_cloth: self.settings.auto_cloth,
+            provisioning_auto_prompt: self.settings.provisioning_auto_prompt,
             ..crate::persistence::AppSettings::default()
         }
     }

@@ -195,10 +195,24 @@ function Install-FaceSidecarEnv {
 # gitignored and the repo carries only the .pt sources, so a fresh
 # checkout has no exported detector and tracking fails to start
 # (AGENTS.md "Tracking"). ultralytics pulls torch, so the first run of
-# this entry is heavyweight; the venv under $TEMP is reused after.
+# this entry is heavyweight; the venv is reused after.
+#
+# The venv lives in tools\yolo-export-venv, which is also where the
+# app's own dependency resolver (src\provisioning) puts it, so running
+# either one first saves the other the ~2.5 GB torch download. An older
+# $TEMP\yolo_export_venv from a previous checkout is reused if it is
+# still there (both sides look for it) rather than rebuilt; $TEMP is
+# not the canonical location because Windows disk-cleanup empties it.
 function Export-Yolo26PoseOnnx {
-    $venv = Join-Path $env:TEMP "yolo_export_venv"
+    $venv = Join-Path $PWD "tools\yolo-export-venv"
     $venvPython = Join-Path $venv "Scripts\python.exe"
+    $legacyVenv = Join-Path $env:TEMP "yolo_export_venv"
+    $legacyPython = Join-Path $legacyVenv "Scripts\python.exe"
+    if ((-not (Test-Path $venvPython)) -and (Test-Path $legacyPython)) {
+        Write-Host "Reusing the existing ultralytics venv at $legacyVenv" -ForegroundColor Green
+        $venv = $legacyVenv
+        $venvPython = $legacyPython
+    }
     if (-not (Test-Path $venvPython)) {
         Write-Host "Creating ultralytics venv ($venv) - downloads torch, one-time..." -ForegroundColor Cyan
         if (Get-Command python -ErrorAction SilentlyContinue) {
@@ -814,8 +828,8 @@ $commands = @(
     # every frame — that starved the render thread back to ~23 fps. 8
     # iterations at damping 0.15 hold the drape while the body is tracked
     # (offline static-settle quality still defaults to 32).
-    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (debug)";     Cmd = 'Install-Models; $env:VULVATAR_FACE_SIDECAR_PYTHON = (Get-FaceSidecarPython); $env:VULVATAR_AUTO_ITERATIONS = "8"; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'')' },
-    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (release)";   Cmd = 'Install-Models; $env:VULVATAR_FACE_SIDECAR_PYTHON = (Get-FaceSidecarPython); $env:VULVATAR_AUTO_ITERATIONS = "8"; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'',''--release'')' },
+    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (debug)";     Cmd = 'Install-Models; $env:VULVATAR_FACE_SIDECAR_PYTHON = (Get-FaceSidecarPython); $env:VULVATAR_AUTO_ITERATIONS = "8"; $env:VULVATAR_POSE_HZ_MIN = "60"; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'')' },
+    @{ Group = "Build & run (RealSense D435 depth)"; Label = "run (release)";   Cmd = 'Install-Models; $env:VULVATAR_FACE_SIDECAR_PYTHON = (Get-FaceSidecarPython); $env:VULVATAR_AUTO_ITERATIONS = "8"; $env:VULVATAR_POSE_HZ_MIN = "60"; $env:RUST_LOG="vulvatar=info"; Invoke-CargoRealsense -CargoArgs @(''run'',''--release'')' },
 
     @{ Group = "Camera & depth"; Label = "diagnose realsense (enumerate + stream test)"; Cmd = "Invoke-CargoRealsense -CargoArgs @('run','--bin','diagnose_realsense')" },
     @{ Group = "Camera & depth"; Label = "depth capture / calib data (RealSense D435)"; Cmd = "Start-DepthCapture" },
