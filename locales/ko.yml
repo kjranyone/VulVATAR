@@ -610,6 +610,8 @@ provisioning:
     face_landmarks: "얼굴 랜드마크 모델 (RTMPose-Face)"
     face_sidecar_venv: "얼굴 사이드카용 Python 환경"
     face_canonical: "얼굴 canonical 메시 대응 데이터"
+    cjk_fonts: "일본어 / 한국어 / 중국어 폰트 (Noto Sans CJK)"
+    icon_font: "아이콘 폰트 (Material Symbols)"
     hand_rtmpose: "손 랜드마크 모델 (RTMPose hand)"
     hand_refiners: "손 정확도 보정 모델 (presence / palm)"
     face_blendshape_mlp: "표정 블렌드셰이프 MLP"

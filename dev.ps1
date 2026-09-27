@@ -111,10 +111,16 @@ function Install-Models {
     # The distilled presence/palm nets are NOT fetchable (offline
     # distillation from this camera's own recordings) — without them the
     # hand chain runs on the SimCC sharpness presence proxy (degraded).
-    Install-DirectFiles -Name "RTMPose-m hand landmark" -Files @(
-        @{ Url = "https://huggingface.co/datasets/DavidPagnon/rtmlib_models/resolve/main/mmpose/rtmposev1/onnx_sdk/rtmpose-m_simcc-hand5_pt-aic-coco_210e-256x256-74fb594_20230320.onnx";
-           OutName = "rtmpose-m-hand_256.onnx" }
-    )
+    # Official OpenMMLab mmdeploy bundle, matching src\provisioning's
+    # manifest. It previously pointed at a third-party HF mirror of the
+    # bare .onnx; the two are the same model, but only this one has been
+    # checked against the ONNX graph (input (1,3,256,256), SimCC
+    # simcc_x/simcc_y (1,21,512)) that fusion/hands.rs requires. One
+    # source means one thing to re-verify.
+    Install-ZipArchive -Name "RTMPose-m hand landmark" `
+        -ArchiveUrl "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-hand5_pt-aic-coco_210e-256x256-74fb594_20230320.zip" `
+        -KeepGlobs @("end2end.onnx") `
+        -RenameMap @{ "end2end.onnx" = "rtmpose-m-hand_256.onnx" }
 
     Install-DirectFiles -Name "RTMPose-Face-WFLW LiteRT (face sidecar)" -Files @(
         @{ Url = "https://huggingface.co/litert-community/RTMPose-Face-WFLW-LiteRT/resolve/main/rtm_face_fp16.tflite";
@@ -187,6 +193,61 @@ function Install-DirectFiles {
         }
         Move-Item $part $dest -Force
         Write-Host "    kept $($f.OutName)" -ForegroundColor Green
+    }
+}
+
+# Download a `.zip`, extract to a temp dir, copy the files matching
+# `KeepGlobs` into models\ (optionally renamed via `RenameMap`), and
+# remove the temp dir.
+#
+# Restored 2026-09-28 alongside Install-DirectFiles: 7e30579 deleted both
+# when it dropped the YOLOX download, and the hand model needs this shape
+# again because OpenMMLab ships mmdeploy bundles as zip.
+function Install-ZipArchive {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [string]$ArchiveUrl,
+        [Parameter(Mandatory)] [string[]]$KeepGlobs,
+        [hashtable]$RenameMap = @{}
+    )
+
+    # Skip the download when every post-rename target is already present.
+    $allPresent = $true
+    foreach ($glob in $KeepGlobs) {
+        $finalName = if ($RenameMap.ContainsKey($glob)) { $RenameMap[$glob] } else { $glob }
+        if (-not (Test-Path "models\$finalName")) { $allPresent = $false; break }
+    }
+    if ($allPresent) {
+        Write-Host "  ${Name}: already installed, skipping" -ForegroundColor Green
+        return
+    }
+
+    Write-Host "  Fetching ${Name}..." -ForegroundColor Cyan
+    $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("vulvatar_models_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+    try {
+        $archivePath = Join-Path $tempDir "archive.zip"
+        Write-Host "    downloading $ArchiveUrl" -ForegroundColor DarkGray
+        & curl.exe --fail --silent --show-error --location $ArchiveUrl -o $archivePath
+        if ($LASTEXITCODE -ne 0) {
+            throw "curl download failed for $Name (exit $LASTEXITCODE): $ArchiveUrl"
+        }
+
+        Write-Host "    extracting..." -ForegroundColor DarkGray
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($archivePath, $tempDir)
+
+        foreach ($glob in $KeepGlobs) {
+            # -Recurse: mmdeploy nests the payload under a dated directory
+            # whose name changes between releases.
+            $matched = Get-ChildItem -Path $tempDir -Recurse -Filter $glob -File
+            if (-not $matched) { throw "$Name archive did not contain $glob" }
+            $finalName = if ($RenameMap.ContainsKey($glob)) { $RenameMap[$glob] } else { $glob }
+            Copy-Item $matched[0].FullName "models\$finalName" -Force
+            Write-Host "    kept $finalName" -ForegroundColor Green
+        }
+    } finally {
+        Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -604,6 +665,10 @@ function Test-DistributionPrereqs {
         # face/hand ONNX bundles are no longer shipped (runtime removed
         # 2026-09-22); the trained hand exports + blendshape MLP stay
         # offline artifacts and are not installer-prerequisites.
+        # The body detector the installer ships (added 2026-09-23).
+        # Without it Inno Setup dies on a missing [Files] source, which
+        # is a far worse error than this check's message.
+        "models\yolo26n-pose_480.onnx",
         "models\rtm_face_fp16.tflite",
         "models\mp_canonical478.npy",
         "models\mp_wflw98_idx.json",
@@ -615,7 +680,7 @@ function Test-DistributionPrereqs {
     if ($missing) {
         Write-Host "Missing files required for installer build:" -ForegroundColor Red
         $missing | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
-        throw "Run the 'setup' menu entry first to download fonts + ONNX models, and ensure docs/licenses are present."
+        throw "Build-Distribution provisions these itself, so a failure here means a download or the ONNX export did not produce its file - check the output above."
     }
 }
 
@@ -756,6 +821,16 @@ function Invoke-CargoRealsense {
 function Build-Distribution {
     param([switch]$Sign)
 
+    # Provision everything the installer bundles instead of telling the
+    # user to run a setup entry first. All three are idempotent and skip
+    # what is present, so a warm tree pays nothing. This is what let the
+    # Setup menu group go: the app resolves its own dependencies at
+    # startup (src\provisioning) and packaging resolves its own here, so
+    # no workflow is left needing a manual step.
+    Write-Host "[0/5] Provisioning bundled assets..." -ForegroundColor Cyan
+    Install-Models
+    Install-Font
+    Export-Yolo26PoseOnnx
     Test-DistributionPrereqs
     $iscc = Find-IsccTool
 
@@ -853,8 +928,6 @@ function Start-DepthCapture {
 
 #region Dev menu
 $commands = @(
-    @{ Group = "Setup";          Label = "setup (download pose models + CJK fonts)"; Cmd = "Install-Models; Install-Font" },
-    @{ Group = "Setup";          Label = "export yolo26-pose ONNX (models/, one-time)"; Cmd = "Export-Yolo26PoseOnnx" },
 
     # D435-exclusive build: `realsense` ships in default features and its
     # build.rs needs the pkg-config + LIBCLANG env, so every build/run goes

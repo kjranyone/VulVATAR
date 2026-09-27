@@ -87,8 +87,11 @@ impl ProvisioningUiState {
     }
 }
 
+/// Dependency ids whose arrival changes what egui can draw.
+const FONT_DEPS: [&str; 2] = ["cjk_fonts", "icon_font"];
+
 /// Drain the resolver and report the outcome. Called once per frame.
-pub(super) fn poll(state: &mut GuiApp) {
+pub(super) fn poll(ctx: &egui::Context, state: &mut GuiApp) {
     let Some(job) = state.provisioning.job.as_mut() else {
         return;
     };
@@ -132,6 +135,21 @@ pub(super) fn poll(state: &mut GuiApp) {
         state.push_notification(t!("provisioning.cancelled").to_string());
     }
 
+    // Fonts are read once in `GuiApp::new`, which runs long before this,
+    // so a freshly fetched font would otherwise not show until the next
+    // launch — and on a fresh checkout that means the user reads this
+    // very dialog as tofu. egui accepts `set_fonts` at any time, so
+    // rebuild the chain now.
+    if job
+        .outcomes
+        .iter()
+        .any(|(id, o)| FONT_DEPS.contains(id) && matches!(o, StepOutcome::Done))
+    {
+        if let Some(fonts) = super::build_font_definitions(&crate::i18n::locale()) {
+            ctx.set_fonts(fonts);
+        }
+    }
+
     // Re-scan: what is still missing after this pass is what the
     // Tracking panel should keep explaining.
     state.provisioning.manual = provisioning::scan(".").manual;
@@ -141,6 +159,11 @@ pub(super) fn poll(state: &mut GuiApp) {
 pub(super) fn draw(ctx: &egui::Context, state: &mut GuiApp) {
     draw_prompt(ctx, state);
     draw_progress(ctx, state);
+}
+
+#[cfg(test)]
+pub(super) fn font_deps() -> [&'static str; 2] {
+    FONT_DEPS
 }
 
 fn draw_prompt(ctx: &egui::Context, state: &mut GuiApp) {
@@ -374,6 +397,20 @@ mod tests {
             }
         }
         crate::i18n::set_locale(&previous);
+    }
+
+    /// `FONT_DEPS` drives the live `set_fonts` re-apply. A renamed
+    /// manifest id would silently stop it, and the symptom — fonts
+    /// fetched but still tofu until restart — looks like an egui bug
+    /// rather than a stale string.
+    #[test]
+    fn font_deps_name_real_manifest_entries() {
+        for id in font_deps() {
+            assert!(
+                provisioning::manifest().iter().any(|d| d.id == id),
+                "`{id}` is not in the manifest"
+            );
+        }
     }
 
     /// Same for the progress stages and the severity lines — these are

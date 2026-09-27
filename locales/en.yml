@@ -610,6 +610,8 @@ provisioning:
     face_landmarks: "Face landmark model (RTMPose-Face)"
     face_sidecar_venv: "Python environment for the face sidecar"
     face_canonical: "Face canonical-mesh correspondence data"
+    cjk_fonts: "Japanese / Korean / Chinese fonts (Noto Sans CJK)"
+    icon_font: "Icon font (Material Symbols)"
     hand_rtmpose: "Hand landmark model (RTMPose hand)"
     hand_refiners: "Hand accuracy refiners (presence / palm)"
     face_blendshape_mlp: "Expression blendshape MLP"

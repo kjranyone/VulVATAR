@@ -127,6 +127,10 @@ will invalidate that cache and trigger a rebuild.
   設定** (damping 0.15 は維持、レンダーは目標 30fps に回復。静止 drape のオフライン
   品質は引き続き既定 32)。A/B ノブ: `VULVATAR_AUTO_DAMPING` / `VULVATAR_AUTO_ITERATIONS`、diagnose_cloth に
   `COLLIDERS_NONE` / `COLLIDERS_NO_THIGH` / `WIND_ON` を追加。
+- **`VULVATAR_POSE_HZ_MIN=60` も run エントリのライブ既定** (dev.ps1、
+  `app/runtime_gpu_budget.rs:221` が読む operator floor)。GPU budget が pose cadence
+  を絞りに来ても 60Hz を下限として持ち上げる。`VULVATAR_AUTO_ITERATIONS=8` と対で
+  「レンダーを守りつつ tracking を落とさない」ライブ構成を作っている。
 - クリアランス (アンチ貫通アンカー) は `src/asset/clearance.rs` の Phase 1/2/3。
   Phase 3 は containment スロットに clearance-mode アンカーを入れる cross-region
   (ジャケット裾↔スカート、スカート↔下着)。アンカー実装を変えたら
@@ -191,10 +195,11 @@ will invalidate that cache and trigger a rebuild.
   `/scratchpad/` `/datasets/` がどちらも gitignore のため**一度も git に入っておらず
   履歴からも復元できない**。無くても quality 低下 (presence は SimCC sharpness
   proxy、acquisition は heuristic crop) で、起動は阻害しない。
-- **hand モデルの取得元が dev.ps1 と Rust で違う** (2026-09-28 時点): dev.ps1 は
-  HF の第三者ミラー (`DavidPagnon/rtmlib_models` の素の .onnx)、Rust マニフェストは
-  公式 `download.openmmlab.com` の mmdeploy zip。どちらも 200 で同じモデルだが、
-  **契約検証を通したのは公式 zip 側だけ**。片方を変えるときは両方見ること。
+- **hand モデルの取得元は公式 OpenMMLab mmdeploy zip に統一済み** (2026-09-28)。
+  dev.ps1 は一時期 HF の第三者ミラー (`DavidPagnon/rtmlib_models` の素の .onnx) を
+  指していたが、**ONNX グラフとの契約検証を通したのは公式 zip 側だけ**なので
+  `Install-ZipArchive` 経由に寄せた。両方とも 55,080,248 bytes で一致を実測。
+  片方を変えるときは必ず両方変えること。
 - `Install-DirectFiles` / `Install-ZipArchive` は 7e30579 の dead-code sweep で
   **定義だけ消され呼び出しが残り**、`Install-Models` が
   「'Install-DirectFiles' は認識されません」で全 run エントリごと落ちていた
@@ -228,11 +233,27 @@ will invalidate that cache and trigger a rebuild.
 - 顔 sidecar の interpreter 優先順位は env (`VULVATAR_FACE_SIDECAR_PYTHON`) >
   `tools/face98-venv` > PATH の裸 `python`。真ん中が無いと、アプリ内解決で venv を
   作ったユーザーが PATH の python を掴み、litert 不在で毎フレーム respawn する。
+- **フォントもマニフェスト管理下** (`cjk_fonts` / `icon_font`, 2026-09-28)。`assets/` は
+  gitignore で otf/ttf は未追跡なので、fresh checkout は CJK が豆腐・アイコンが空白に
+  なる。そして旧警告は「dev.ps1 Install-Font を実行」— **UI が読めない人間に読ませる
+  案内**だった。`build_font_definitions` は `GuiApp::new` の早期 (fonts は line 377、
+  scan は 445) で一度だけ読むため、取得しても次回起動まで効かない。egui の
+  `set_fonts` は実行時に呼べるので、**`gui::provisioning::poll` がフォント依存の
+  解決を検出したら即座に再適用する** (再起動不要)。`FONT_DEPS` の id が
+  マニフェストと一致することはテスト `font_deps_name_real_manifest_entries` で固定 —
+  id を変えると豆腐が残り、egui のバグに見える。
+- **dev.ps1 の Setup メニュー群は削除済み** (2026-09-28)。アプリが起動時に自前で
+  解決し、`Build-Distribution` が同梱物を自前で用意する (`Install-Models` /
+  `Install-Font` / `Export-Yolo26PoseOnnx` を先頭で呼ぶ — いずれも冪等で既存は
+  スキップ) ので、手動ステップを要する経路が無くなった。`Test-DistributionPrereqs`
+  には `models\yolo26n-pose_480.onnx` を追加済み (.iss が同梱するのにチェック漏れ
+  だった — 無いと Inno Setup が [Files] の source 欠落で落ち、原因が読めない)。
 - `settings.json` の `provisioning_auto_prompt: false` で起動時ダイアログを止められる
   (scan 自体は走り続ける — 「なぜ手が追えないか」の答えに要る)。
-- 検証: ユニットは `cargo test --lib provisioning` (23件)。**実ネットワーク/実 python の
+- 検証: ユニットは `cargo test --lib provisioning` (24件)。**実ネットワーク/実 python の
   end-to-end は `tests/provisioning_fetch.rs` (`--ignored`)** — DL・キャンセル後始末・
-  venv 新規作成・検出器 export・hand モデル DL+`HandBackend` ロードの 5 本。
+  venv 新規作成・検出器 export・hand モデル DL+`HandBackend` ロード・
+  CJK フォント 3 zip (複数項目 `DownloadZip` の唯一のカバレッジ) の 6 本。
   `job.rs` を触ったら必ず回す (root 二重解決・`\\?\` 拒否・URL 空白混入・
   exit-0 な壊れ interpreter は**いずれもユニットテストでは出ず、これで出た**):
   ```powershell

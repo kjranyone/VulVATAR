@@ -65,6 +65,19 @@ pub enum Probe {
     },
 }
 
+/// One archive in a [`Resolution::DownloadZip`]: fetch `url`, pull out
+/// the entry whose file name is `keep`, write it to `dest`.
+///
+/// `keep` is matched on the file name alone, at any depth — upstream
+/// bundles nest their payload under a dated or versioned directory that
+/// changes between releases.
+#[derive(Debug, Clone, Copy)]
+pub struct ZipItem {
+    pub url: &'static str,
+    pub keep: &'static str,
+    pub dest: &'static str,
+}
+
 /// How a missing dependency is obtained.
 #[derive(Debug, Clone, Copy)]
 pub enum Resolution {
@@ -73,18 +86,14 @@ pub enum Resolution {
         url: &'static str,
         dest: &'static str,
     },
-    /// Fetch a zip from `url`, keep the single entry whose file name is
-    /// `keep`, and write it to `dest`.
+    /// Fetch each zip and keep one entry out of it.
     ///
-    /// OpenMMLab's mmdeploy bundles ship this way — one `end2end.onnx`
-    /// inside a versioned directory, alongside metadata. `dev.ps1`'s
-    /// `Install-ZipArchive` does the same thing for YOLOX; this is the
-    /// Rust half of that contract.
-    DownloadZip {
-        url: &'static str,
-        keep: &'static str,
-        dest: &'static str,
-    },
+    /// A slice rather than a single item because some dependencies are
+    /// one logical thing split across archives upstream — the CJK font
+    /// set is three separate release zips, and listing them as three
+    /// dependencies would put three lines in the consent dialog for what
+    /// the user thinks of as "the fonts".
+    DownloadZip { items: &'static [ZipItem] },
     /// Create a venv at `dir` and `pip install` `packages` into it.
     PythonVenv {
         dir: &'static str,
@@ -259,12 +268,12 @@ pub fn manifest() -> &'static [Dependency] {
             id: "hand_rtmpose",
             probe: Probe::AnyFile(&["models/rtmpose-m-hand_256.onnx"]),
             resolution: Resolution::DownloadZip {
-                // One line on purpose: rustfmt collapses a `\`-continued
-                // string literal and leaves the indentation INSIDE it,
-                // which curl then rejects as a malformed URL.
-                url: "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-hand5_pt-aic-coco_210e-256x256-74fb594_20230320.zip",
-                keep: "end2end.onnx",
-                dest: "models/rtmpose-m-hand_256.onnx",
+                items: &[ZipItem {
+                    // URLs stay on one line — see `manifest_urls_are_clean`.
+                    url: "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-hand5_pt-aic-coco_210e-256x256-74fb594_20230320.zip",
+                    keep: "end2end.onnx",
+                    dest: "models/rtmpose-m-hand_256.onnx",
+                }],
             },
             approx_bytes: 51_300_000,
             severity: Severity::Degraded,
@@ -290,6 +299,61 @@ pub fn manifest() -> &'static [Dependency] {
                 doc: "AGENTS.md#tracking-fusion-estimator (retrain required)",
             },
             approx_bytes: 0,
+            severity: Severity::Degraded,
+        },
+        // The GUI's fonts. `assets/` is gitignored and none of these are
+        // committed, so a fresh checkout renders Japanese/Korean/Chinese
+        // as tofu and every icon as a blank box — and the warning it
+        // printed said "run dev.ps1 Install-Font", which a user who
+        // cannot read the UI cannot act on.
+        //
+        // `build_font_definitions` reads them from `assets/` at startup,
+        // but egui accepts `set_fonts` at any time, so `gui::provisioning`
+        // re-applies them the moment these land — no restart.
+        Dependency {
+            id: "cjk_fonts",
+            probe: Probe::AllFiles(&[
+                "assets/NotoSansJP-Regular.otf",
+                "assets/NotoSansKR-Regular.otf",
+                "assets/NotoSansSC-Regular.otf",
+            ]),
+            resolution: Resolution::DownloadZip {
+                items: &[
+                    ZipItem {
+                        url: "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/16_NotoSansJP.zip",
+                        keep: "NotoSansJP-Regular.otf",
+                        dest: "assets/NotoSansJP-Regular.otf",
+                    },
+                    // KR and SC are not redundant with JP: without KR,
+                    // Hangul is tofu; without SC, simplified-only forms
+                    // fall back to Japanese shapes.
+                    ZipItem {
+                        url: "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/17_NotoSansKR.zip",
+                        keep: "NotoSansKR-Regular.otf",
+                        dest: "assets/NotoSansKR-Regular.otf",
+                    },
+                    ZipItem {
+                        url: "https://github.com/notofonts/noto-cjk/releases/download/Sans2.004/18_NotoSansSC.zip",
+                        keep: "NotoSansSC-Regular.otf",
+                        dest: "assets/NotoSansSC-Regular.otf",
+                    },
+                ],
+            },
+            approx_bytes: 120_000_000,
+            severity: Severity::Degraded,
+        },
+        // Material Symbols Rounded — every icon glyph in the mode nav,
+        // top bar and status indicators. Google publishes no
+        // static-weight build, so the variable font is the only
+        // embeddable distribution.
+        Dependency {
+            id: "icon_font",
+            probe: Probe::AnyFile(&["assets/MaterialSymbolsRounded.ttf"]),
+            resolution: Resolution::Download {
+                url: "https://github.com/google/material-design-icons/raw/master/variablefont/MaterialSymbolsRounded%5BFILL%2CGRAD%2Copsz%2Cwght%5D.ttf",
+                dest: "assets/MaterialSymbolsRounded.ttf",
+            },
+            approx_bytes: 15_000_000,
             severity: Severity::Degraded,
         },
         // Optional refinement: without it the sidecar still produces
@@ -528,16 +592,20 @@ mod tests {
     #[test]
     fn manifest_urls_are_clean() {
         for dep in manifest() {
-            let url = match dep.resolution {
-                Resolution::Download { url, .. } | Resolution::DownloadZip { url, .. } => url,
+            let urls: Vec<&str> = match dep.resolution {
+                Resolution::Download { url, .. } => vec![url],
+                Resolution::DownloadZip { items } => items.iter().map(|i| i.url).collect(),
                 _ => continue,
             };
-            assert!(
-                !url.chars().any(char::is_whitespace),
-                "`{}` has whitespace in its URL: {url:?}",
-                dep.id
-            );
-            assert!(url.starts_with("https://"), "`{}` is not https", dep.id);
+            assert!(!urls.is_empty(), "`{}` has no URL to fetch", dep.id);
+            for url in urls {
+                assert!(
+                    !url.chars().any(char::is_whitespace),
+                    "`{}` has whitespace in its URL: {url:?}",
+                    dep.id
+                );
+                assert!(url.starts_with("https://"), "`{}` is not https", dep.id);
+            }
         }
     }
 

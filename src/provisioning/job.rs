@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use log::{info, warn};
 
-use super::{Dependency, Resolution, YOLO_EXPORT_VENV};
+use super::{Dependency, Resolution, ZipItem, YOLO_EXPORT_VENV};
 
 /// `CREATE_NO_WINDOW` — keep provisioning children off the user's
 /// screen (see module docs).
@@ -253,8 +253,14 @@ impl StepCtx<'_> {
 fn resolve(dep: &Dependency, ctx: &StepCtx) -> Result<(), String> {
     match dep.resolution {
         Resolution::Download { url, dest } => download(url, dest, dep.approx_bytes, ctx),
-        Resolution::DownloadZip { url, keep, dest } => {
-            download_zip(url, keep, dest, dep.approx_bytes, ctx)
+        Resolution::DownloadZip { items } => {
+            // Split the size estimate across the archives so the bar
+            // advances per item instead of jumping to "done" on the first.
+            let each = dep.approx_bytes / items.len().max(1) as u64;
+            for item in items {
+                download_zip(item, each, ctx)?;
+            }
+            Ok(())
         }
         Resolution::PythonVenv { dir, packages } => ensure_venv(dir, packages, ctx).map(|_| ()),
         Resolution::UltralyticsExport {
@@ -301,14 +307,14 @@ fn download(url: &str, dest: &str, approx_bytes: u64, ctx: &StepCtx) -> Result<(
 /// Nothing is written to `dest` until the wanted entry is in hand, so a
 /// failure here cannot leave a file that the next [`super::scan`] would
 /// accept.
-fn download_zip(
-    url: &str,
-    keep: &str,
-    dest: &str,
-    approx_bytes: u64,
-    ctx: &StepCtx,
-) -> Result<(), String> {
-    let dest = ctx.root.join(dest);
+fn download_zip(item: &ZipItem, approx_bytes: u64, ctx: &StepCtx) -> Result<(), String> {
+    let (url, keep) = (item.url, item.keep);
+    let dest = ctx.root.join(item.dest);
+    // Already there from an earlier item or an earlier run: a multi-item
+    // dependency is only partly missing most of the time.
+    if dest.is_file() {
+        return Ok(());
+    }
     create_parent(&dest)?;
 
     // Scratch space beside the destination: same volume, so the final

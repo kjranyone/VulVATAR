@@ -236,3 +236,51 @@ fn fetches_and_loads_the_hand_landmark_model() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The multi-item zip path: three separate upstream release archives that
+/// together form one dependency, each contributing a single `.otf`.
+///
+/// Also the only test that covers a `DownloadZip` whose payload is NOT at
+/// a fixed depth — the Noto release zips nest differently from the
+/// mmdeploy bundles.
+#[test]
+#[ignore = "network: downloads three Noto CJK release zips (~120 MB)"]
+fn fetches_the_cjk_font_set() {
+    let root = scratch("fonts");
+    std::fs::create_dir_all(root.join("assets")).expect("assets dir");
+    let dep = dep("cjk_fonts");
+    assert!(!dep.is_satisfied(&root));
+
+    let mut job = ProvisionJob::spawn(root.clone(), vec![dep]);
+    run(&mut job, Duration::from_secs(1200));
+
+    match &job.outcomes[0].1 {
+        StepOutcome::Done => {}
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert!(
+        dep.is_satisfied(&root),
+        "one of the three fonts did not land where the probe looks"
+    );
+    for name in [
+        "NotoSansJP-Regular.otf",
+        "NotoSansKR-Regular.otf",
+        "NotoSansSC-Regular.otf",
+    ] {
+        let p = root.join("assets").join(name);
+        let size = std::fs::metadata(&p)
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .len();
+        assert!(size > 1_000_000, "{name} is only {size} bytes");
+        println!("  {name}: {size} bytes");
+    }
+    // Every scratch directory must be cleaned up, for all three items.
+    let strays: Vec<_> = std::fs::read_dir(root.join("assets"))
+        .expect("read assets")
+        .flatten()
+        .filter(|e| e.path().is_dir() || e.path().extension().is_some_and(|x| x == "part"))
+        .map(|e| e.file_name())
+        .collect();
+    assert!(strays.is_empty(), "left behind: {strays:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}

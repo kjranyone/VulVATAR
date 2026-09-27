@@ -610,6 +610,8 @@ provisioning:
     face_landmarks: "面部关键点模型 (RTMPose-Face)"
     face_sidecar_venv: "面部 sidecar 用 Python 环境"
     face_canonical: "面部 canonical 网格对应数据"
+    cjk_fonts: "日文 / 韩文 / 中文字体 (Noto Sans CJK)"
+    icon_font: "图标字体 (Material Symbols)"
     hand_rtmpose: "手部关键点模型 (RTMPose hand)"
     hand_refiners: "手部精度优化模型 (presence / palm)"
     face_blendshape_mlp: "表情 blendshape MLP"

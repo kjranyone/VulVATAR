@@ -41,7 +41,10 @@ use crate::tracking::{
 ///
 /// Returns `None` when none of the three Noto Sans CJK subsets are
 /// installed under `assets/` — egui then keeps its default Latin-only
-/// fonts. Run `dev.ps1` `Install-Font` to download them.
+/// fonts. The startup dependency prompt offers to fetch them
+/// (`provisioning`'s `cjk_fonts`), and `gui::provisioning` calls
+/// `set_fonts` again once they land, so the tofu clears without a
+/// restart.
 ///
 /// Locale-aware ordering matters because most CJK Unified Ideographs
 /// exist in all three fonts but render with different glyph shapes
@@ -1234,7 +1237,7 @@ impl eframe::App for GuiApp {
         self.poll_avatar_load_job();
         // Drain the dependency resolver: toasts on completion, and a
         // re-scan so the still-missing list stays truthful.
-        provisioning::poll(self);
+        provisioning::poll(ctx, self);
 
         // Path 1: reconcile GUI-owned settings into Application before
         // running the frame. See the wiring overview above

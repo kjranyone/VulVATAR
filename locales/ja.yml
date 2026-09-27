@@ -610,6 +610,8 @@ provisioning:
     face_landmarks: "顔ランドマークモデル (RTMPose-Face)"
     face_sidecar_venv: "顔サイドカー用 Python 環境"
     face_canonical: "顔 canonical メッシュ対応データ"
+    cjk_fonts: "日本語・韓国語・中国語フォント (Noto Sans CJK)"
+    icon_font: "アイコンフォント (Material Symbols)"
     hand_rtmpose: "手のランドマークモデル (RTMPose hand)"
     hand_refiners: "手の検出精度向上モデル (presence / palm)"
     face_blendshape_mlp: "表情ブレンドシェイプ MLP"
