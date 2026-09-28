@@ -358,6 +358,35 @@ will invalidate that cache and trigger a rebuild.
   まで同梱漏れ)。リリースビルド前に export を済ませておくこと。hand の必須 1 本は
   導入環境でもアプリ内解決で DL できるので同梱は任意 (presence/palm は同梱のみ)。
 
+## 60 fps 推論
+
+設計と段別予算は **[docs/tracking-60fps-design.md](docs/tracking-60fps-design.md)**。
+運用上の要点だけここに置く。
+
+- **60 Hz solver プロファイルは `capture_fps >= 50` で自動** (`4680fc9`: seed cadence 3 /
+  dense stride ×1.5 / LM 反復上限)。**offline で測るには
+  `VULVATAR_REPLAY_CAPTURE_FPS=60`** — これが無かった間、60 fps のために作られた
+  プロファイルを誰も replay で検証できなかった。
+- **estimator コストの 95% は dense 表面点** (実測: `acc` 19.3ms → `VULVATAR_FUSION_NO_DENSE`
+  で 0.95ms)。`dense` phase 自体は 0.09ms — **点を作るのは安く、残差に積むのが高い**。
+  よって予算調整の主ノブは `VULVATAR_DENSE_STRIDE_MUL`。
+- **stride を触るときは `dense surface:` 行を見ること**。`MIN_DENSE_SURFACE_POINTS = 200`
+  を割ると dense 項が**丸ごと落ちる**ので段階的劣化ではなく崖になる。実測点数
+  (stride 8 / ×1.5 / ×2 / ×3) = 2433 / 1083 / 608 / 270 (中央値)。**×3 は最悪録画で
+  12% のフレームが床未満 → 却下**、×2 が安全上限。`frames.csv` の `n3d` は疎観測数
+  (≈40) でこれは見えない。
+- **未解決: 60 Hz プロファイルは最悪録画で品質を落とす**。R wrist max jump
+  0.464 → 0.765m、torso yaw 誤差裾 43.6° → 71.1°。**dense stride は無罪** (×1.5 で既に
+  出て ×2/×3 で増えない) なので `VULVATAR_FUSION_SEED_EVERY_N` /
+  `VULVATAR_LM_MAX_ITERS` の切り分けが必要。速度は届いているがこれを抱えたままでは
+  出せない。
+- **cadence はフレーム数ではなく壁時計で書く**。フレーム数の間引きは capture rate で
+  意味が変わる (同じ `=2` が 30fps で 15Hz、60fps で 30Hz = 秒あたりコスト 2 倍)。
+  顔は `face_interval_ms` (66ms)、hand は `VULVATAR_HAND_MIN_INTERVAL_MS` (60ms) で
+  両方移行済み。フレーム数ルールは**位相**(左右交互 = 1 フレーム 1 推論) と
+  timestamp 欠損時の fallback としてのみ残す。60ms なのは 30fps の交互性が 66.7ms
+  間隔で、66 だと clock jitter で誤って弾かれるから (テストで固定)。
+
 ## Tracking (fusion estimator)
 
 - 本番プロバイダは `FusionProvider` (`src/tracking/fusion/provider.rs`) の一本のみ。ファクトリは `create_pose_provider` (`src/tracking/provider.rs`、`inference` feature 経由)。現行仕様は `docs/tracking-v2-design.md` (As-Is のみ、経緯は書かない)。

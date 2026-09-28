@@ -125,6 +125,34 @@ fn hand_cold_after() -> u32 {
 /// that means touching the temporal contract; capping candidates
 /// ([`hand_cold_candidates`]) buys most of the speed without going near it.
 /// Kept as an A/B knob, not a default.
+/// Wall-clock floor between runs of ONE hand's crop ladder, in ms
+/// (`VULVATAR_HAND_MIN_INTERVAL_MS`).
+///
+/// [`DEFAULT_HAND_EVERY_N`] alone is a frame COUNT, so its meaning moves
+/// with the capture rate: the same `=2` is 15 Hz at 30 fps but 30 Hz at
+/// 60 fps, which doubles the hand chain's per-second cost exactly where
+/// the budget is tightest. The face chain already learned this and moved
+/// to a wall-clock interval (`yolo26.rs`, "frame-count modulo would
+/// double it at 60 fps"); this is the same fix for hands.
+///
+/// The two mechanisms compose: the frame-count rule supplies the PHASE
+/// (hands alternate, so only one landmark pass lands per frame) and this
+/// floor supplies the RATE. At 30 fps alternation already spaces a hand's
+/// runs 66.7 ms apart, so the floor never bites; at 60 fps it halves the
+/// 30 Hz that alternation would otherwise give, holding the cost flat.
+///
+/// 60 rather than 66 deliberately: at 30 fps alternation lands at
+/// 66.7 ms, and a floor of 66 would be tripped by a few ms of device
+/// clock jitter and silently drop that hand to 4-frame spacing.
+pub(crate) const DEFAULT_HAND_MIN_INTERVAL_MS: f64 = 60.0;
+
+fn hand_min_interval_ms() -> f64 {
+    std::env::var("VULVATAR_HAND_MIN_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_HAND_MIN_INTERVAL_MS)
+}
+
 pub(crate) const DEFAULT_HAND_COLD_STRIDE: u64 = 1;
 
 fn hand_cold_stride() -> u64 {
@@ -313,6 +341,9 @@ pub struct FusionProvider {
     /// ~14 ms each. Re-acquisition is still full-ladder, just not every
     /// frame.
     hand_cold_misses: [u32; 2],
+    /// Capture timestamp (ms) of each hand's last ladder run, for the
+    /// wall-clock rate floor (see [`DEFAULT_HAND_MIN_INTERVAL_MS`]).
+    last_hand_ts_ms: [f64; 2],
     h: Humanoid,
     est: Estimator,
     body_map: BodyMap,
@@ -608,6 +639,7 @@ impl FusionProvider {
             last_hands: [None, None],
             prev_hands: [None, None],
             hand_cold_misses: [0, 0],
+            last_hand_ts_ms: [f64::NEG_INFINITY; 2],
             h,
             est,
             body_map,
@@ -738,6 +770,7 @@ impl PoseProvider for FusionProvider {
         self.est.reset(&self.h.model);
         self.prev_hands = [None, None];
         self.hand_cold_misses = [0, 0];
+        self.last_hand_ts_ms = [f64::NEG_INFINITY; 2];
         self.face_fit.reset();
         self.head_ori.reset();
         self.hand_unsupported = [0, 0];
@@ -1334,6 +1367,7 @@ impl FusionProvider {
             let cold_after = hand_cold_after();
             let cold_stride = hand_cold_stride();
             let cold_candidates = hand_cold_candidates();
+            let min_interval_ms = hand_min_interval_ms();
             let pregate_m = hand_pregate_m();
             let dedup_iou = hand_dedup_iou();
             for hand in 0..2 {
@@ -1356,6 +1390,17 @@ impl FusionProvider {
                 let stride = if cold { cold_stride.max(every_n) } else { every_n };
                 if stride > 1 && frame_index % stride != (hand as u64) % stride {
                     continue;
+                }
+                // Wall-clock rate floor on top of the frame-count phase, so
+                // the hand rate does not scale with the capture rate (see
+                // `DEFAULT_HAND_MIN_INTERVAL_MS`). Skipped only when the
+                // device clock is available; without it the frame-count
+                // rule above stands on its own, as it did before.
+                if let Some(now_ms) = ts_ms {
+                    if now_ms - self.last_hand_ts_ms[hand] < min_interval_ms {
+                        continue;
+                    }
+                    self.last_hand_ts_ms[hand] = now_ms;
                 }
                 // Gate anchor: the body-detector wrist is a MEASUREMENT that
                 // tracks a raised arm even while no hand lock exists, so
@@ -3604,6 +3649,30 @@ mod hand_work_throttle_tests {
     #[test]
     fn hand_rate_is_halved_by_default() {
         assert_eq!(DEFAULT_HAND_EVERY_N, 2);
+    }
+
+    /// The wall-clock floor must not bite at 30 fps, where the frame-count
+    /// alternation already spaces one hand's runs 2/30 s = 66.7 ms apart.
+    /// A floor at or above that would be tripped by device clock jitter and
+    /// silently drop the hand to 4-frame spacing.
+    #[test]
+    fn hand_interval_leaves_headroom_at_30_fps() {
+        let spacing_30 = 1000.0 * DEFAULT_HAND_EVERY_N as f64 / 30.0;
+        assert!(
+            DEFAULT_HAND_MIN_INTERVAL_MS < spacing_30,
+            "floor {DEFAULT_HAND_MIN_INTERVAL_MS} ms >= 30 fps spacing {spacing_30} ms"
+        );
+    }
+
+    /// ...and it MUST bite at 60 fps, which is the whole point: there
+    /// alternation would give 30 Hz and double the chain's per-second cost.
+    #[test]
+    fn hand_interval_caps_the_rate_at_60_fps() {
+        let spacing_60 = 1000.0 * DEFAULT_HAND_EVERY_N as f64 / 60.0;
+        assert!(
+            DEFAULT_HAND_MIN_INTERVAL_MS > spacing_60,
+            "floor {DEFAULT_HAND_MIN_INTERVAL_MS} ms <= 60 fps spacing {spacing_60} ms,              so the hand chain would run at 30 Hz there"
+        );
     }
 
     /// The stride must stay uniform: `hand_every_n` is unconditional while

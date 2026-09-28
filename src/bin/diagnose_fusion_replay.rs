@@ -321,6 +321,19 @@ fn main() -> Result<(), String> {
     if std::env::var_os("VULVATAR_REPLAY_CPU").is_some() {
         cfg.force_cpu = true;
     }
+    // The 60 Hz solver profile (arm-seed cadence, dense stride x1.5,
+    // tighter LM cap) keys off `capture_fps >= 50`, which only the GUI
+    // used to set — so the profile that exists specifically to hit 60 fps
+    // could not be measured offline at all. `VULVATAR_REPLAY_CAPTURE_FPS`
+    // makes it replayable; the harness clock stays nominal 30 fps (see the
+    // module header), so this selects the PROFILE, not the frame pacing.
+    if let Some(fps) = std::env::var("VULVATAR_REPLAY_CAPTURE_FPS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        cfg.capture_fps = fps;
+        eprintln!("replay: capture_fps={fps} (60 Hz profile active at >= 50)");
+    }
     let mut provider = FusionProvider::from_models_dir_with_config("models", cfg)?;
     // Optional avatar rendering rig.
     let mut avatar_rig = if let Some(vrm) = avatar_vrm.as_ref() {
@@ -398,6 +411,13 @@ fn main() -> Result<(), String> {
     ];
     let mut phase_ms: Vec<[f32; 15]> = Vec::new();
     let mut hand_frames = [0usize; 2];
+    // Dense surface-point count per frame. The dense term is ~95% of the
+    // estimator's cost (acc 19.3 -> 0.95 ms with VULVATAR_FUSION_NO_DENSE),
+    // so `VULVATAR_DENSE_STRIDE_MUL` is the main 60 Hz budget knob — but
+    // `MIN_DENSE_SURFACE_POINTS` drops the whole term below 200 points, so
+    // raising the stride without watching this walks off a cliff instead of
+    // trading gradually. `n3d` is the SPARSE count and does not show it.
+    let mut dense_n: Vec<usize> = Vec::with_capacity(pairs.len());
     let mut lw_prev: Option<V3> = None;
     let mut rw_prev: Option<V3> = None;
     let mut lw_jumps = Vec::new();
@@ -454,6 +474,7 @@ fn main() -> Result<(), String> {
         let depth_pts = metric.points_m.clone();
         provider.set_external_depth(metric);
         let est_out = provider.estimate_pose(rgb.as_raw(), cw, ch, n as u64);
+        dense_n.push(provider.last_dense_n);
         {
             let exprs = &est_out.skeleton.expressions;
             let get = |name: &str| -> f32 {
@@ -1590,6 +1611,19 @@ fn main() -> Result<(), String> {
         provider.estimator().diag.cov_failures
     );
     println!("hand crops: L {} R {} frames with presence≥0.5 (of {}); hand-block L/R re-labels {}; duplicate locks {}", hand_frames[0], hand_frames[1], pairs.len(), provider.hand_swaps, provider.hand_dupes);
+    if !dense_n.is_empty() {
+        let mut v = dense_n.clone();
+        v.sort_unstable();
+        let starved = v.iter().filter(|&&n| n < 200).count();
+        println!(
+            "dense surface: med {} points, min {}, p05 {} — frames under the 200-point floor: {} ({:.0}%)",
+            v[v.len() / 2],
+            v[0],
+            v[v.len() / 20],
+            starved,
+            100.0 * starved as f64 / v.len() as f64,
+        );
+    }
     // Hand-ladder work: how many 256x256 landmark passes the chain
     // actually ran, and how often it spent a whole ladder for no lock.
     // The phase timing alone cannot separate "expensive model" from
