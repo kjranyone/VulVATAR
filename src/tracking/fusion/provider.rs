@@ -7,6 +7,189 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 
+/// Hand-chain work counters, for turning "the ladder is thrashing" from a
+/// story into a number. Read via [`hand_work_snapshot`].
+///
+/// `[0]` landmark inferences run (each is a 256x256 RTMPose forward pass —
+/// this is where the phase's milliseconds go), `[1]` ladders entered
+/// (one per hand per frame that reached the crop loop), `[2]` ladders that
+/// ended with nothing locked.
+///
+/// The ratio `[0]/[1]` is the average candidates tried per attempt, and
+/// `[2]/[1]` is how often the whole ladder was spent for no result. The
+/// documented 50-70 ms "all candidates fail" cost is the worst case; these
+/// say how close the typical frame sits to it.
+static HAND_WORK: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+/// Candidates skipped by the pre-inference depth check
+/// ([`hand_pregate_m`]) — each one is a ~14 ms landmark pass not run.
+static PREGATE_SKIPS: AtomicU32 = AtomicU32::new(0);
+
+/// Candidates dropped as duplicate windows (see `DEFAULT_HAND_DEDUP_IOU`).
+static DEDUP_SKIPS: AtomicU32 = AtomicU32::new(0);
+
+/// `[inferences, ladders_entered, ladders_with_no_lock]` since process
+/// start. Callers difference successive snapshots for a per-frame view.
+pub fn hand_work_snapshot() -> [u32; 3] {
+    [
+        HAND_WORK[0].load(std::sync::atomic::Ordering::Relaxed),
+        HAND_WORK[1].load(std::sync::atomic::Ordering::Relaxed),
+        HAND_WORK[2].load(std::sync::atomic::Ordering::Relaxed),
+    ]
+}
+
+/// Candidates the depth pre-gate skipped before paying for an inference.
+pub fn hand_pregate_skips() -> u32 {
+    PREGATE_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Candidates dropped as duplicate windows before any inference.
+pub fn hand_dedup_skips() -> u32 {
+    DEDUP_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run the hand chain every Nth frame (`VULVATAR_HAND_EVERY_N`, default
+/// 1 = every frame). Same shape as the face chain's `VULVATAR_FACE_EVERY_N`,
+/// which was set to 2 on 2026-09-24 for exactly this reason: the stage cost
+/// was pushing publish below the capture rate. Skipped frames keep the last
+/// lock, so the published wrist does not drop out — it just stops being
+/// re-measured for one frame.
+pub(crate) const DEFAULT_HAND_EVERY_N: u64 = 1;
+
+fn hand_every_n() -> u64 {
+    std::env::var("VULVATAR_HAND_EVERY_N")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_HAND_EVERY_N)
+}
+
+/// After this many consecutive empty ladders a hand is "cold" and is only
+/// searched every [`hand_cold_stride`] frames
+/// (`VULVATAR_HAND_COLD_AFTER`, 0 disables the throttle).
+fn hand_cold_after() -> u32 {
+    std::env::var("VULVATAR_HAND_COLD_AFTER")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(3)
+}
+
+/// Frame stride for a cold hand (`VULVATAR_HAND_COLD_STRIDE`, default 1 =
+/// off).
+///
+/// **Measured regression, which is why the default is off.** Stride 3 cut
+/// the hand phase ~45% on all three recordings, but right-wrist snaps on
+/// `s1789246660` went 17 -> 31 (max jump 0.726 -> 0.778 m). Sampling every
+/// third frame while the acquisition streak counts *frames* turns "3
+/// consecutive frames of evidence" into "3 samples spread over 9 frames",
+/// which is a much weaker gate on a hand that is moving or absent. Fixing
+/// that means touching the temporal contract; capping candidates
+/// ([`hand_cold_candidates`]) buys most of the speed without going near it.
+/// Kept as an A/B knob, not a default.
+pub(crate) const DEFAULT_HAND_COLD_STRIDE: u64 = 1;
+
+fn hand_cold_stride() -> u64 {
+    std::env::var("VULVATAR_HAND_COLD_STRIDE")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(DEFAULT_HAND_COLD_STRIDE)
+}
+
+/// How many NON-palm crop candidates a cold hand may try per frame
+/// (`VULVATAR_HAND_COLD_CANDIDATES`, default 1; 0 = uncapped).
+///
+/// **Measured failure, which is why the default is 0.** A cap of 1 looked
+/// excellent on cost (hand phase 85.8 -> 26.3 ms) and was in fact turning
+/// hand tracking off: locks collapsed 49/223 -> 7/38 on `s1789246660` and
+/// 57/103 -> 10/0 on `s1789242856`. The breadth of the ladder IS the
+/// acquisition mechanism — candidate 0 is "re-crop last frame's lock",
+/// which by definition does not exist for a hand that has none, so capping
+/// at 1 leaves a cold hand with no way back. Kept as an A/B knob only.
+pub(crate) const DEFAULT_HAND_COLD_CANDIDATES: usize = 0;
+
+fn hand_cold_candidates() -> usize {
+    std::env::var("VULVATAR_HAND_COLD_CANDIDATES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_HAND_COLD_CANDIDATES)
+}
+
+/// Minimum IoU at which two crop candidates count as the same window
+/// (`VULVATAR_HAND_DEDUP_IOU`, 0 disables).
+///
+/// The ladder's sources overlap by construction: "re-crop last frame's
+/// lock" and "the model's prediction" land on the same pixels whenever
+/// tracking is steady, and the detector hand block joins them once the arm
+/// is settled. Running the same window through a 256x256 landmark pass
+/// twice cannot produce a different answer, so this is speed with no
+/// behavioural change at all — unlike capping or striding the ladder, both
+/// of which lost locks (see `hand_cold_candidates` / `hand_cold_stride`).
+///
+/// 0.9 rather than 1.0 because the crops are floats derived from slightly
+/// different arithmetic; windows agreeing to a tenth of their area give
+/// the same landmarks.
+pub(crate) const DEFAULT_HAND_DEDUP_IOU: f32 = 0.9;
+
+fn hand_dedup_iou() -> f32 {
+    std::env::var("VULVATAR_HAND_DEDUP_IOU")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(DEFAULT_HAND_DEDUP_IOU)
+}
+
+/// IoU of two square crops given as `(x0, y0, size)`.
+pub(crate) fn crop_iou(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+    let ix = (a.0 + a.2).min(b.0 + b.2) - a.0.max(b.0);
+    let iy = (a.1 + a.2).min(b.1 + b.2) - a.1.max(b.1);
+    if ix <= 0.0 || iy <= 0.0 {
+        return 0.0;
+    }
+    let inter = ix * iy;
+    let union = a.2 * a.2 + b.2 * b.2 - inter;
+    if union <= 0.0 {
+        0.0
+    } else {
+        inter / union
+    }
+}
+
+/// Depth tolerance for a pre-inference candidate check, in metres
+/// (`VULVATAR_HAND_PREGATE_M`, 0 disables).
+///
+/// The idea: the depth-consistency gate that rejects hallucinated locks
+/// runs *after* the landmark pass, so every rejection has already cost a
+/// ~14 ms 256x256 forward. Sampling depth at the crop centre first would
+/// skip passes that could not have survived the real gate anyway.
+///
+/// **Measured, and OFF by default.** Three variants at 0.45 m against
+/// three recordings all bought speed with left-hand locks:
+///
+/// | variant | s1789246660 hands med | L locks |
+/// |---|---|---|
+/// | off | 55.5 ms | 49 |
+/// | `abs(z - anchor)`, 7x7 median | 44.2 ms | 35 |
+/// | `z - anchor >`, 7x7 median | 43.3 ms | 34 |
+/// | `z - anchor >`, nearest-surface | 46.0 ms | 38 |
+///
+/// The asymmetry (reject only crops BEHIND the anchor, since the
+/// documented failure is a window that captured the wall) and the
+/// nearest-surface read (the palm tier's own answer to this boundary
+/// problem) were each aimed at the suspected cause, and neither recovered
+/// the locks. So the premise is wrong: a crop is ~1.7x the hand span, and
+/// no fixed-radius sample at its centre reliably lands on the hand.
+/// Sampling the whole crop would cost what it saves. Kept as an A/B knob;
+/// the verdict is that cheap pre-rejection needs the palm net's proposals,
+/// which is exactly what is missing.
+pub(crate) const DEFAULT_HAND_PREGATE_M: f64 = 0.0;
+
+fn hand_pregate_m() -> f64 {
+    std::env::var("VULVATAR_HAND_PREGATE_M")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_HAND_PREGATE_M)
+}
+
 /// Aggregate palm-candidate outcome tallies for `VULVATAR_HAND_PALM_DEBUG`:
 /// [proposed, depth-gate reject, handedness reject, passed all gates].
 static PALM_TALLY: [AtomicU32; 4] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
@@ -82,6 +265,15 @@ pub struct FusionProvider {
     /// Last LOCKED hand results (persist across a frame where every crop
     /// missed) — the seed for the temporal crop candidate.
     prev_hands: [Option<super::hands::HandResult>; 2],
+    /// Consecutive crop-ladder attempts that locked nothing, per hand.
+    ///
+    /// Drives the cold-hand stride: a hand that has not been seen for a
+    /// while is searched less often. Measured motivation — on a recording
+    /// where the right hand is absent for all 782 frames, the ladder was
+    /// still entered 782 times and ran 2.9 landmark passes per frame at
+    /// ~14 ms each. Re-acquisition is still full-ladder, just not every
+    /// frame.
+    hand_cold_misses: [u32; 2],
     h: Humanoid,
     est: Estimator,
     body_map: BodyMap,
@@ -376,6 +568,7 @@ impl FusionProvider {
             hands,
             last_hands: [None, None],
             prev_hands: [None, None],
+            hand_cold_misses: [0, 0],
             h,
             est,
             body_map,
@@ -505,6 +698,7 @@ impl PoseProvider for FusionProvider {
         }
         self.est.reset(&self.h.model);
         self.prev_hands = [None, None];
+        self.hand_cold_misses = [0, 0];
         self.face_fit.reset();
         self.head_ori.reset();
         self.hand_unsupported = [0, 0];
@@ -1097,7 +1291,33 @@ impl FusionProvider {
             } else {
                 Vec::new()
             };
+            let every_n = hand_every_n();
+            let cold_after = hand_cold_after();
+            let cold_stride = hand_cold_stride();
+            let cold_candidates = hand_cold_candidates();
+            let pregate_m = hand_pregate_m();
+            let dedup_iou = hand_dedup_iou();
             for hand in 0..2 {
+                // Work throttle, before any inference is paid for. Two
+                // independent reasons to skip this hand this frame:
+                //
+                //  * the global stride (`VULVATAR_HAND_EVERY_N`), the same
+                //    lever the face chain uses;
+                //  * this hand is cold — the ladder has come up empty
+                //    `cold_after` times running, so searching it every frame
+                //    is pure waste. Measured: a recording with the right
+                //    hand absent throughout still entered its ladder on all
+                //    782 frames.
+                //
+                // A skip keeps `prev_hands[hand]`, so a held lock is
+                // republished rather than dropped; only the re-measurement
+                // is deferred. Re-acquisition stays full-ladder and is
+                // delayed by at most `cold_stride - 1` frames.
+                let cold = cold_after > 0 && self.hand_cold_misses[hand] >= cold_after;
+                let stride = if cold { cold_stride.max(every_n) } else { every_n };
+                if stride > 1 && frame_index % stride != (hand as u64) % stride {
+                    continue;
+                }
                 // Gate anchor: the body-detector wrist is a MEASUREMENT that
                 // tracks a raised arm even while no hand lock exists, so
                 // acquisition prefers it over the FK prior — whose wrist can
@@ -1415,10 +1635,39 @@ impl FusionProvider {
                         }
                     }
                 }
+                // Drop windows that duplicate an earlier candidate. Order
+                // is significance order (best first), so the survivor is
+                // always the higher-priority source, and `palm_from` is
+                // recomputed so the palm exemption still points at the
+                // right slice.
+                let mut palm_from = palm_from;
+                if dedup_iou > 0.0 && candidates.len() > 1 {
+                    let mut kept: Vec<(f32, f32, f32)> = Vec::with_capacity(candidates.len());
+                    let mut kept_palm_from = 0usize;
+                    for (i, c) in candidates.iter().copied().enumerate() {
+                        if kept.iter().any(|k| crop_iou(*k, c) >= dedup_iou) {
+                            DEDUP_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                        if i < palm_from {
+                            kept_palm_from = kept.len() + 1;
+                        }
+                        kept.push(c);
+                    }
+                    palm_from = kept_palm_from;
+                    candidates = kept;
+                }
                 let mut best: Option<super::hands::HandResult> = None;
+                HAND_WORK[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let palm_debug = std::env::var_os("VULVATAR_HAND_PALM_DEBUG").is_some();
                 for (ci, crop) in candidates.into_iter().enumerate() {
                     let is_palm = ci >= palm_from;
+                    // Cold-hand breadth cap: stop widening the heuristic
+                    // search while there is nothing to find. Palm proposals
+                    // are exempt (see `hand_cold_candidates`).
+                    if cold && !is_palm && cold_candidates > 0 && ci >= cold_candidates {
+                        continue;
+                    }
                     if is_palm {
                         PALM_TALLY[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -1433,6 +1682,47 @@ impl FusionProvider {
                             );
                         }
                     }
+                    // Pre-inference depth check (see `hand_pregate_m`).
+                    // Palm proposals are exempt: they come with their own
+                    // nearest-surface sampling tier because their peaks sit
+                    // on the hand/background boundary, where a plain median
+                    // flips to the wall behind.
+                    if pregate_m > 0.0 && !is_palm {
+                        let anchor_z = meas_anchor.map(|a| a[2]).or(Some(p_fk[2]));
+                        if let (Some(az), Some(pts)) = (anchor_z, hand_depth_pts) {
+                            let cx = (crop.0 + 0.5 * crop.2) as f64 / width as f64;
+                            let cy = (crop.1 + 0.5 * crop.2) as f64 / height as f64;
+                            // NEAREST, not median. The crop is ~1.7x the
+                            // hand span, so its centre routinely lands on
+                            // the background AROUND a perfectly good hand —
+                            // a median there read the wall and this gate
+                            // threw away 15 of 49 left-hand locks on
+                            // s1789246660. The same reasoning the palm
+                            // depth tier already documents: a hand is the
+                            // nearest surface patch in its own window.
+                            if let Some(z) = super::coherence::sample_depth_nearest(
+                                pts, width, height, cx, cy,
+                            ) {
+                                // Asymmetric on purpose. The documented
+                                // failure this gate exists for is a crop
+                                // that captured the BACKGROUND — "ceiling /
+                                // window crops", "0.6 m hand over a 3 m
+                                // wall". A crop centre NEARER than the
+                                // anchor is an ordinary hand reaching
+                                // toward the camera, and rejecting those
+                                // cost 29% of the left-hand locks on
+                                // s1789246660 when this was |z - az|.
+                                if z - az > pregate_m {
+                                    PREGATE_SKIPS.fetch_add(
+                                        1,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    HAND_WORK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     if let Some(mut res) = hl.estimate(rgb_data, width, height, crop) {
                         res.src = ci as u8;
                         // Presence authority: the calibrated net. Palm
@@ -1607,6 +1897,13 @@ impl FusionProvider {
                 // left slot reads ≈0.15, the right ≈0.85 (measured on a
                 // clip with one raised, unambiguous hand). Scores inside
                 // the middle band are genuinely uncertain and pass.
+
+                if best.as_ref().is_none_or(|r| r.presence < 0.5) {
+                    HAND_WORK[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.hand_cold_misses[hand] = self.hand_cold_misses[hand].saturating_add(1);
+                } else {
+                    self.hand_cold_misses[hand] = 0;
+                }
 
                 // Body-detector corroboration (see `hand_unsupported`).
                 if let Some(res) = best.as_ref().filter(|r| r.presence >= 0.5) {
@@ -3159,5 +3456,94 @@ mod live_pipeline_tests {
 
         // Drop joins the detector thread; if it deadlocked this hangs.
         drop(provider);
+    }
+}
+
+#[cfg(test)]
+mod hand_work_throttle_tests {
+    use super::*;
+
+    /// Both throttles that were measured to hurt must ship inert.
+    ///
+    /// Stride 3 traded ~45% of the hand phase for right-wrist snaps
+    /// 17 -> 31 on s1789246660 (it samples every third frame while the
+    /// acquisition streak counts frames, so "3 consecutive frames of
+    /// evidence" silently became "3 samples over 9 frames"). A candidate
+    /// cap of 1 traded 85.8 -> 26.3 ms for locks 49/223 -> 7/38, because
+    /// candidate 0 is "re-crop last frame's lock" and a cold hand has
+    /// none. Numbers are in AGENTS.md; these asserts stop either from
+    /// becoming the default on a whim.
+    #[test]
+    fn measured_regressions_ship_disabled() {
+        assert_eq!(DEFAULT_HAND_EVERY_N, 1, "hand chain must run every frame");
+        assert_eq!(DEFAULT_HAND_COLD_STRIDE, 1, "stride 3 cost snaps 17 -> 31");
+        assert_eq!(
+            DEFAULT_HAND_COLD_CANDIDATES, 0,
+            "a cap of 1 collapsed locks 49/223 -> 7/38"
+        );
+    }
+
+    #[test]
+    fn identical_crops_have_iou_one() {
+        let c = (100.0, 50.0, 64.0);
+        assert!((crop_iou(c, c) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn disjoint_crops_have_iou_zero() {
+        assert_eq!(crop_iou((0.0, 0.0, 32.0), (100.0, 100.0, 32.0)), 0.0);
+        // Touching edges share no area.
+        assert_eq!(crop_iou((0.0, 0.0, 32.0), (32.0, 0.0, 32.0)), 0.0);
+    }
+
+    /// Half-overlap must land well under the dedup threshold: two windows
+    /// that see different halves of the scene are genuinely different
+    /// candidates and both deserve an inference.
+    #[test]
+    fn half_overlap_is_not_a_duplicate() {
+        let iou = crop_iou((0.0, 0.0, 64.0), (32.0, 0.0, 64.0));
+        assert!(iou > 0.3 && iou < 0.4, "iou {iou}");
+        assert!(iou < DEFAULT_HAND_DEDUP_IOU);
+    }
+
+    /// A few pixels of float drift between two sources computing the same
+    /// window is exactly the case dedup exists for.
+    #[test]
+    fn near_identical_crops_are_duplicates() {
+        let iou = crop_iou((100.0, 50.0, 64.0), (101.0, 50.5, 64.0));
+        assert!(
+            iou >= DEFAULT_HAND_DEDUP_IOU,
+            "1 px of drift must still dedup, got {iou}"
+        );
+    }
+
+    /// Guard the threshold itself: at 1.0 only bit-identical crops would
+    /// dedup and the optimisation would silently do nothing.
+    #[test]
+    fn dedup_threshold_is_below_one() {
+        assert!(DEFAULT_HAND_DEDUP_IOU > 0.0 && DEFAULT_HAND_DEDUP_IOU < 1.0);
+    }
+
+    /// The pre-gate is the lever that shipped on, so its tolerance must
+    /// stay far looser than the post-inference gate it front-runs
+    /// (0.14 m): the crop centre is not the wrist, and a hand has its own
+    /// depth extent. Tightening it toward the post-gate would start
+    /// rejecting real hands before they are ever evaluated.
+    #[test]
+    fn pregate_ships_disabled() {
+        assert_eq!(
+            DEFAULT_HAND_PREGATE_M, 0.0,
+            "every pre-gate variant traded left-hand locks for speed"
+        );
+    }
+
+    /// Dedup is the one throttle that shipped on, because it is the only
+    /// one that cannot change the answer: the same window run twice
+    /// returns the same landmarks. Locks were identical or better on all
+    /// three recordings (right-hand 98 -> 105 on s1789242856) while
+    /// inferences per frame fell 4-13%.
+    #[test]
+    fn dedup_ships_enabled() {
+        assert!(DEFAULT_HAND_DEDUP_IOU > 0.0);
     }
 }

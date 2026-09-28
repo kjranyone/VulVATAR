@@ -1590,6 +1590,30 @@ fn main() -> Result<(), String> {
         provider.estimator().diag.cov_failures
     );
     println!("hand crops: L {} R {} frames with presence≥0.5 (of {}); hand-block L/R re-labels {}; duplicate locks {}", hand_frames[0], hand_frames[1], pairs.len(), provider.hand_swaps, provider.hand_dupes);
+    // Hand-ladder work: how many 256x256 landmark passes the chain
+    // actually ran, and how often it spent a whole ladder for no lock.
+    // The phase timing alone cannot separate "expensive model" from
+    // "tried the model many times per frame".
+    let [infers, ladders, no_lock] = vulvatar_lib::tracking::fusion::provider::hand_work_snapshot();
+    if ladders > 0 {
+        println!(
+            "hand ladder: {} inferences / {} attempts = {:.2} per attempt;              {} attempts locked nothing ({:.0}%); {:.2} inferences per frame",
+            infers,
+            ladders,
+            infers as f64 / ladders as f64,
+            no_lock,
+            100.0 * no_lock as f64 / ladders as f64,
+            infers as f64 / pairs.len() as f64,
+        );
+        println!(
+            "hand pregate: {} candidates skipped before inference",
+            vulvatar_lib::tracking::fusion::provider::hand_pregate_skips()
+        );
+        println!(
+            "hand dedup: {} duplicate windows dropped",
+            vulvatar_lib::tracking::fusion::provider::hand_dedup_skips()
+        );
+    }
     println!("csv: {}", out_dir.join("frames.csv").display());
     Ok(())
 }
