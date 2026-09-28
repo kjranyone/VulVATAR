@@ -352,9 +352,13 @@ pub struct FusionProvider {
     /// depth-lifted mesh landmarks.
     face_fit: super::canonical_face::FaceFit,
     head_ori: super::head_ori::HeadOriTracker,
-    /// Capture feed is ≥ 50 fps: the reduced solver profile (arm-seed
-    /// cadence 3, dense stride ×1.5, and the frame budget halved) is
-    /// active — see `TrackingPipelineConfig::capture_fps`.
+    /// Capture feed is ≥ 50 fps: the reduced solver profile (dense stride
+    /// ×1.5 and a tighter LM cap) is active — see
+    /// `TrackingPipelineConfig::capture_fps`.
+    ///
+    /// The profile used to also thin the arm-seed contest to every 3rd
+    /// frame; that was measured to cost quality AND time and is gone (see
+    /// `seed_every_n` at the use site).
     config_60hz: bool,
     /// Consecutive frames each locked hand crop has gone WITHOUT
     /// corroboration from the body detector (wrist / hand-block keypoints
@@ -570,7 +574,7 @@ impl FusionProvider {
         let dir = models_dir.as_ref();
         let config_60hz = config.capture_fps >= 50;
         if config_60hz {
-            info!("fusion: 60 Hz capture — reduced solver profile (seed/3, stride x1.5)");
+            info!("fusion: 60 Hz capture — reduced solver profile (LM cap 4, dense stride x1.5)");
         }
         let opts = DetectorOptions {
             force_cpu: config.force_cpu,
@@ -3168,11 +3172,57 @@ impl FusionProvider {
         // wrist-hold term keeps unobserved wrists stable in between and
         // the seed gate still fires on the due frames after a loss, so
         // re-acquisition is delayed by at most N-1 frames.
+        // Every frame, at 30 AND 60 Hz.
+        //
+        // The 60 Hz profile shipped this at 3 on the assumption that arm
+        // seeds are a luxury the halved budget cannot afford. A 2x2
+        // isolation against `VULVATAR_LM_MAX_ITERS` on s1789246660 says it
+        // is a pure loss — worse quality AND more time:
+        //
+        // | seed | LM | seeds med | torso yaw err max | L duty |
+        // |---|---|---|---|---|
+        // |  1 |  8 | 13.87 ms  | +44.2 deg         | 0.41   |
+        // |  3 |  8 | 18.52 ms  | +68.2 deg         | 0.23   |
+        // |  1 |  4 | 10.46 ms  | +43.5 deg         | 0.38   |
+        // |  3 |  4 | 14.06 ms  | +68.2 deg         | 0.33   |
+        //
+        // The yaw error tail is cleanly bimodal on the seed cadence and
+        // nothing else (dense stride does not move it: 44.4 deg at
+        // stride x2 with seed 1, 70.0 with seed 3), and the cost goes the
+        // WRONG way — skipping the contest lets the arm drift, which loses
+        // the lock more often, and the loss path runs the contest anyway
+        // with more work to do. Measured +35% on the seeds phase at both
+        // stride x1 and stride x2.
+        //
+        // The original A/B reported "head/torso metrics hold"; it was
+        // reading means. The mean barely moves (+2.0 -> +2.4 deg) while
+        // the tail doubles, which is exactly what AGENTS.md's desk metrics
+        // (wrist jumps, data-sigma duty) exist to catch.
+        //
+        // One metric does favour cadence 3 and it is a trap: the rig arm's
+        // MEAN rotation jump is 5.4 deg at cadence 3 vs 10.2 at 1. That
+        // reads as smoother until you notice 10.2 is what the 30 Hz default
+        // produces (9.9-11.1 measured) and that duty collapses alongside it
+        // (L 0.49 -> 0.33, R 0.51 -> 0.47). The arm is not steadier, it is
+        // driven by confident data less of the time and drifts smoothly in
+        // between. Paired run, 60 Hz profile, everything else equal:
+        //
+        // | | seed 1 | seed 3 |
+        // |---|---|---|
+        // | seeds med | 5.54 ms | 8.93 ms |
+        // | torso yaw err max | +48.8 deg | +67.9 deg |
+        // | L / R duty | 0.49 / 0.51 | 0.33 / 0.47 |
+        // | R wrist max jump | 0.520 m | 0.731 m |
+        // | rig wrist snaps | 0 | 0 |
+        //
+        // `rig wrist snaps` is 0 either way — the source-side wrist jumps
+        // this recording shows are absorbed downstream, so they are not the
+        // deciding metric here.
         let seed_every_n: u64 = std::env::var("VULVATAR_FUSION_SEED_EVERY_N")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&n| n >= 1)
-            .unwrap_or(if self.config_60hz { 3 } else { 1 });
+            .unwrap_or(1);
         if seed_every_n <= 1 || frame_index % seed_every_n == 0 {
             super::seed::update_with_arm_seeds(&self.h, &mut self.est, &obs);
         }

@@ -375,11 +375,27 @@ will invalidate that cache and trigger a rebuild.
   (stride 8 / ×1.5 / ×2 / ×3) = 2433 / 1083 / 608 / 270 (中央値)。**×3 は最悪録画で
   12% のフレームが床未満 → 却下**、×2 が安全上限。`frames.csv` の `n3d` は疎観測数
   (≈40) でこれは見えない。
-- **未解決: 60 Hz プロファイルは最悪録画で品質を落とす**。R wrist max jump
-  0.464 → 0.765m、torso yaw 誤差裾 43.6° → 71.1°。**dense stride は無罪** (×1.5 で既に
-  出て ×2/×3 で増えない) なので `VULVATAR_FUSION_SEED_EVERY_N` /
-  `VULVATAR_LM_MAX_ITERS` の切り分けが必要。速度は届いているがこれを抱えたままでは
-  出せない。
+- **arm seed contest は間引くな (2026-09-28、既定を 60 Hz でも 1 に戻した)**。
+  60 Hz プロファイルは当初 `seed_every_n = 3` を含んでいたが、2×2 切り分け
+  (`VULVATAR_FUSION_SEED_EVERY_N` × `VULVATAR_LM_MAX_ITERS`、dense stride 固定) の
+  結果、**品質も時間も損する純損失**だった:
+  - torso yaw 誤差の**裾**が seed cadence だけで二値化 (seed=1 → 43-49°、
+    seed=3 → 68°)。LM 上限も dense stride も動かさない。
+  - `seeds` phase が **+34-61%** (13.87→18.52 / 10.46→14.06 / 5.54→8.93、3 条件で再現)。
+    **間引くと腕がドリフトしてロックを失い、loss 経路が結局 contest を回す** — しかも
+    仕事が増えた状態で。hand ladder の cold stride と同じ形の負のフィードバック。
+  - duty も崩れる (L 0.49 → 0.33)。
+  **`LM_MAX_ITERS` 8 → 4 は無罪どころか得** (`main` 22.65 → 16.33ms、品質同等以上) なので
+  60 Hz プロファイルはこれと dense stride ×1.5 だけを残した。
+- **平均だけ見て A/B を通すな**。上の seed cadence は当初「head/torso metrics hold」で
+  通っていた。実際 torso yaw 誤差の **mean は +2.0 → +2.4 でほぼ不変**、壊れていたのは
+  **最大値 (44° → 68°) と duty**。AGENTS.md がデスク指標に「手首ジャンプ/snap 数、
+  data-σ duty、胴 yaw std」を挙げているのはこれを捕まえるため。
+- **rig 側と source 側を混同するな**。source の手首 snaps は retarget で吸収され、
+  `rig wrist snaps` は全構成で 0 / `rig wrist max jump` は 0.120m にクランプされる。
+  一方 **rig arm の平均回転ジャンプは罠**: seed cadence 3 で 5.4° (vs 1 で 10.2°) と
+  「滑らか」に見えるが、10.2° が 30 Hz 既定の実測値 (9.9-11.1°) で、5.4° は duty 崩壊と
+  同時に起きている = **安定ではなく追従不足**。
 - **cadence はフレーム数ではなく壁時計で書く**。フレーム数の間引きは capture rate で
   意味が変わる (同じ `=2` が 30fps で 15Hz、60fps で 30Hz = 秒あたりコスト 2 倍)。
   顔は `face_interval_ms` (66ms)、hand は `VULVATAR_HAND_MIN_INTERVAL_MS` (60ms) で
