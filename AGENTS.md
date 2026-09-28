@@ -235,7 +235,8 @@ will invalidate that cache and trigger a rebuild.
   作ったユーザーが PATH の python を掴み、litert 不在で毎フレーム respawn する。
 - **hand チェーンのコスト = 推論回数 × ~14ms (2026-09-28 計測、蒸留なしでの対処)**。
   `phase hands` を分解した結果、コストは**ランドマーク推論の回数に完全比例**していた
-  (256×256 RTMPose 1 回が約 13-16ms):
+  (256×256 RTMPose 1 回が実パイプラインで約 11-12ms — 単体ベンチは 6.68ms で、差は
+  検出器セッションとの GPU 競合):
 
   | session | 推論/frame | 候補/試行 | ロック無し試行 | hands med |
   |---|---|---|---|---|
@@ -264,12 +265,34 @@ will invalidate that cache and trigger a rebuild.
 
   **教訓**: 「無い手を探す無駄」を安く弾くには palm net の提案が必要で、それが欠けている
   ものそのもの。幅を削る・時間を間引く・深度で先読みする、はどれも代償を払う。
-- **残るギャップ**: dedup 後も最悪録画は hands med 53.6ms で 30fps 予算 33ms を超える
-  (s1789246274 は 22.9ms で予算内)。蒸留を使わない次の手は**バッチ推論** — hand ONNX の
-  入力は `(batch,3,256,256)` で**バッチ軸が動的**(実測) なので、ladder の候補を 1 回の
-  forward にまとめれば数学的に同一の結果で呼び出し回数を落とせる。ただし現在の ladder は
-  最初の成功で打ち切るため、ロック済みの安い場合 (1.44 候補/試行) では総計算量が増える
-  — cold 時のみバッチ化する条件分岐が要る。未実装。
+- **予算内に入れたのは `VULVATAR_HAND_EVERY_N=2` (既定、2026-09-28)**。左右を交互に
+  サンプリングして推論回数を半減する。顔チェーンが 2026-09-24 に採った手と同じ。
+  **出荷既定での最終実測** (`diagnostics/fusion/final_*`):
+
+  | session | hands med | L snaps | R snaps | rig wrist snaps |
+  |---|---|---|---|---|
+  | s1789246274 | 13.1ms | 0 | 0 | 0 |
+  | s1789242856 | 16.3ms | 0 | 10 | 0 |
+  | s1789246660 | 26.8ms | 0 | 16 | 0 |
+
+  **3 録画すべて 33ms 予算内**、L snaps は全て 0 に、R snaps も 17→16 / 12→10 と改善。
+  `hand crops` の半減は**測定アーチファクト** — 標本フレームが半分なので当然で、
+  **試行あたりのロック率は不変** (s1789246274 55%→55%、s1789246660 R 28.5%→28.1%)。
+  代償は duty (s1789242856 R 0.52→0.38): 手首が確信データで駆動される割合が下がり、
+  更新が 30Hz→15Hz になる。顔の表情が受け入れたのと同じ取引。
+  **`hand_cold_stride` との違いは均一性**: こちらは常に一定間隔、cold stride は
+  ロック状態で間隔が変わる = 信号が変わる瞬間にサンプリング間隔も変わるため悪化した。
+- **バッチ推論は却下 (DirectML で逆に激遅、実測)**。hand ONNX の入力はバッチ軸が動的
+  (`(batch,3,256,256)`) なので候補をまとめられるはずだったが、ベンチ
+  (`hands::batch_bench::hand_batch_is_worth_it`、`--ignored`) の結果は
+  **batch1 6.68ms / batch2 44.99ms (6.7倍) / batch3 49.13ms (7.4倍)** — バッチを
+  一切 amortise しない。**hot path を改修する前に測って回避した。**
+- **コストは landmark 呼び出しがほぼ全部**: 実測で `landmark 66.7ms/frame` 対
+  `phase 67.07ms`、深度ゲートは 0.01ms/frame。候補あたりの CPU 準備
+  (`fill_crop_tensor` + 正規化) も 1.23ms と軽微
+  (`hands::batch_bench::where_does_the_per_candidate_time_go`)。ただし
+  **1 推論は単体ベンチ 6.68ms に対し実パイプラインでは 11-12ms** — 検出器セッションとの
+  GPU 競合で約 2 倍。つまり「推論回数を減らす」以外に効く手は無い。
 - **refiner 3 本が無い状態の実測ベースライン (2026-09-28)**。presence/palm/blendshape が
   欠けたままでも hand チェーンは起動する (必須は landmark 1 本だけ) が、**コストが跳ねる**。
   同一録画 `s1789246660` (782f) の `phase hands`:
@@ -314,6 +337,13 @@ will invalidate that cache and trigger a rebuild.
   だった — 無いと Inno Setup が [Files] の source 欠落で落ち、原因が読めない)。
 - `settings.json` の `provisioning_auto_prompt: false` で起動時ダイアログを止められる
   (scan 自体は走り続ける — 「なぜ手が追えないか」の答えに要る)。
+- **`rust_i18n::set_locale` をテストで呼ぶな (2026-09-28 に踏んだ)**。プロセス
+  グローバルなので、locale を切り替えるテストは並列実行中の他テストを巻き込む。
+  provisioning の locale 網羅テストが ja/ko/zh に切り替えていたため、英語文字列
+  (`"Could not auto-bind"`) を assert する `gui::rebind_integration_tests` の 2 件が
+  3 回に 1 回落ちていた (`497b57e` から潜在)。現在は `locales/*.yml` を直接読んで
+  キーの存在を確認する形に書き換え済み — グローバルに触らず、しかも実行時 locale と
+  無関係に 4 言語すべてを検査できる。
 - 検証: ユニットは `cargo test --lib provisioning` (24件)。**実ネットワーク/実 python の
   end-to-end は `tests/provisioning_fetch.rs` (`--ignored`)** — DL・キャンセル後始末・
   venv 新規作成・検出器 export・hand モデル DL+`HandBackend` ロード・

@@ -378,25 +378,93 @@ mod tests {
         assert_eq!(with.manual.len(), without.manual.len());
     }
 
-    /// `rust-i18n` returns the key itself on a miss, so an untranslated
-    /// dependency would ship as a literal `provisioning.dep.hand_chain`
-    /// in the dialog. Check every id against every locale.
-    #[test]
-    fn every_dependency_is_named_in_every_locale() {
-        let previous = crate::i18n::locale();
-        for locale in crate::i18n::available_locales() {
-            crate::i18n::set_locale(locale);
-            for dep in provisioning::manifest() {
-                let name = dep_name(dep);
-                assert!(
-                    !name.contains("provisioning.dep."),
-                    "{locale}: no name for `{}`",
-                    dep.id
-                );
-                assert!(!name.is_empty(), "{locale}: empty name for `{}`", dep.id);
+    /// Keys for `provisioning.dep.*`, `provisioning.stage.*` and
+    /// `provisioning.severity.*` must exist in every locale.
+    ///
+    /// Read from the YAML rather than through `t!`, deliberately.
+    /// `rust_i18n::set_locale` mutates a PROCESS-GLOBAL, and the earlier
+    /// version of this test switched it to ja/ko/zh while the rest of the
+    /// suite ran in parallel — which made
+    /// `gui::rebind_integration_tests` flaky, because those assert on an
+    /// English notification string. A test that reads files has no such
+    /// reach, and it checks all four locales regardless of what the
+    /// runtime happens to be set to.
+    fn locale_keys(locale: &str, section: &str) -> Vec<String> {
+        let path = std::path::Path::new("locales").join(format!("{locale}.yml"));
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let mut in_provisioning = false;
+        let mut in_section = false;
+        let mut keys = Vec::new();
+        for line in text.lines() {
+            if !line.starts_with(' ') && !line.trim().is_empty() {
+                in_provisioning = line.starts_with("provisioning:");
+                in_section = false;
+                continue;
+            }
+            if !in_provisioning {
+                continue;
+            }
+            // Two-space keys are the section heads; four-space keys are
+            // their entries.
+            if let Some(name) = line.strip_prefix("  ").filter(|l| !l.starts_with(' ')) {
+                in_section = name.trim_end() == format!("{section}:");
+                continue;
+            }
+            if in_section {
+                if let Some(entry) = line.strip_prefix("    ") {
+                    if let Some((k, _)) = entry.split_once(':') {
+                        keys.push(k.trim().to_string());
+                    }
+                }
             }
         }
-        crate::i18n::set_locale(&previous);
+        keys
+    }
+
+    #[test]
+    fn every_dependency_is_named_in_every_locale() {
+        for locale in crate::i18n::available_locales() {
+            let keys = locale_keys(locale, "dep");
+            assert!(!keys.is_empty(), "{locale}: no provisioning.dep section");
+            for dep in provisioning::manifest() {
+                assert!(
+                    keys.iter().any(|k| k == dep.id),
+                    "{locale}: no name for `{}` (have {keys:?})",
+                    dep.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_stage_and_severity_is_translated() {
+        use crate::provisioning::job::Stage;
+        let stages = [
+            Stage::Downloading,
+            Stage::Extracting,
+            Stage::CreatingVenv,
+            Stage::InstallingPackages,
+            Stage::Exporting,
+        ];
+        for locale in crate::i18n::available_locales() {
+            let have = locale_keys(locale, "stage");
+            for stage in stages {
+                // `provisioning.stage.downloading` -> `downloading`
+                let leaf = stage.i18n_key().rsplit('.').next().unwrap();
+                assert!(
+                    have.iter().any(|k| k == leaf),
+                    "{locale}: no stage string for `{leaf}` (have {have:?})"
+                );
+            }
+            let sev = locale_keys(locale, "severity");
+            for name in ["blocking", "degraded"] {
+                assert!(
+                    sev.iter().any(|k| k == name),
+                    "{locale}: no severity string for `{name}`"
+                );
+            }
+        }
     }
 
     /// `FONT_DEPS` drives the live `set_fonts` re-apply. A renamed
@@ -411,34 +479,5 @@ mod tests {
                 "`{id}` is not in the manifest"
             );
         }
-    }
-
-    /// Same for the progress stages and the severity lines — these are
-    /// the strings a user reads while a 2.5 GB download runs.
-    #[test]
-    fn every_stage_and_severity_is_translated() {
-        use crate::provisioning::job::Stage;
-        let previous = crate::i18n::locale();
-        for locale in crate::i18n::available_locales() {
-            crate::i18n::set_locale(locale);
-            for stage in [
-                Stage::Downloading,
-                Stage::Extracting,
-                Stage::CreatingVenv,
-                Stage::InstallingPackages,
-                Stage::Exporting,
-            ] {
-                let key = stage.i18n_key();
-                assert_ne!(t!(key), key, "{locale}: untranslated {key}");
-            }
-            for severity in [Severity::Blocking, Severity::Degraded] {
-                let label = severity_label(severity);
-                assert!(
-                    !label.contains("provisioning.severity."),
-                    "{locale}: {label}"
-                );
-            }
-        }
-        crate::i18n::set_locale(&previous);
     }
 }

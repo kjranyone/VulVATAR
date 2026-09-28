@@ -1613,6 +1613,18 @@ fn main() -> Result<(), String> {
             "hand dedup: {} duplicate windows dropped",
             vulvatar_lib::tracking::fusion::provider::hand_dedup_skips()
         );
+        // Attribution: how much of the hand phase is the landmark call
+        // itself. A standalone bench puts one forward at 6.7 ms, so a
+        // number far above `inferences x 6.7` means GPU contention with
+        // the detector session rather than a slow ladder.
+        let [infer_us, gate_us] = vulvatar_lib::tracking::fusion::provider::hand_time_us();
+        let per_frame = |us: u64| us as f64 / 1000.0 / pairs.len() as f64;
+        println!(
+            "hand time: landmark {:.1} ms/frame ({:.1} ms per inference), depth gate {:.2} ms/frame",
+            per_frame(infer_us),
+            if infers > 0 { infer_us as f64 / 1000.0 / infers as f64 } else { 0.0 },
+            per_frame(gate_us),
+        );
     }
     println!("csv: {}", out_dir.join("frames.csv").display());
     Ok(())

@@ -5,7 +5,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU32, AtomicU64};
 
 /// Hand-chain work counters, for turning "the ladder is thrashing" from a
 /// story into a number. Read via [`hand_work_snapshot`].
@@ -28,6 +28,22 @@ static PREGATE_SKIPS: AtomicU32 = AtomicU32::new(0);
 /// Candidates dropped as duplicate windows (see `DEFAULT_HAND_DEDUP_IOU`).
 static DEDUP_SKIPS: AtomicU32 = AtomicU32::new(0);
 
+/// Microseconds spent inside the landmark call, and inside the depth gate.
+///
+/// Attribution, not curiosity: a standalone bench puts one forward at
+/// 6.7 ms, so 2.45 candidates should be ~16 ms, yet the hand phase measures
+/// 23-56 ms. Guessing which of the ladder's steps holds the rest is how
+/// this project has wasted cycles before.
+static HAND_US: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// `[landmark_us, depth_gate_us]` since process start.
+pub fn hand_time_us() -> [u64; 2] {
+    [
+        HAND_US[0].load(std::sync::atomic::Ordering::Relaxed),
+        HAND_US[1].load(std::sync::atomic::Ordering::Relaxed),
+    ]
+}
+
 /// `[inferences, ladders_entered, ladders_with_no_lock]` since process
 /// start. Callers difference successive snapshots for a per-frame view.
 pub fn hand_work_snapshot() -> [u32; 3] {
@@ -48,13 +64,36 @@ pub fn hand_dedup_skips() -> u32 {
     DEDUP_SKIPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Run the hand chain every Nth frame (`VULVATAR_HAND_EVERY_N`, default
-/// 1 = every frame). Same shape as the face chain's `VULVATAR_FACE_EVERY_N`,
-/// which was set to 2 on 2026-09-24 for exactly this reason: the stage cost
-/// was pushing publish below the capture rate. Skipped frames keep the last
-/// lock, so the published wrist does not drop out — it just stops being
-/// re-measured for one frame.
-pub(crate) const DEFAULT_HAND_EVERY_N: u64 = 1;
+/// Run each hand's crop ladder every Nth frame (`VULVATAR_HAND_EVERY_N`),
+/// alternating hands so the per-frame inference count halves at 2.
+///
+/// **This is the lever that brought the phase inside budget** (2026-09-28).
+/// The face chain took the same step on 2026-09-24 for the same reason. At
+/// N=2 the landmark call is the whole phase cost and there are half as many
+/// of them:
+///
+/// | session | hands med N=1 -> N=2 | R snaps | locks per attempt |
+/// |---|---|---|---|
+/// | s1789246660 | 57.0 -> 25.3 ms | 17 -> 11 | 28.5% -> 28.1% |
+/// | s1789242856 | 28.4 -> 15.1 ms | 12 -> 8 | 13.4% -> 11.5% |
+/// | s1789246274 | 23.2 -> 13.5 ms | 0 -> 0 | 55% -> 55% |
+///
+/// Snaps got BETTER, not worse: fewer measurements means fewer chances for
+/// a bad one to jerk the wrist, and the estimator coasts in between. The
+/// raw "hand crops" count halves, but that is the metric counting sampled
+/// frames — the lock rate PER ATTEMPT is unchanged, which is the thing that
+/// says acquisition still works.
+///
+/// Note the contrast with [`hand_cold_stride`], which also skipped frames
+/// and made snaps worse (17 -> 31). The difference is uniformity: this
+/// cadence never changes, while the cold stride switched rate exactly when
+/// the hand's lock state changed, so the sampling interval moved at the
+/// same moment the signal did.
+///
+/// The cost is duty: the wrist is confidently data-driven less of the time
+/// (s1789242856 right hand 0.52 -> 0.32). Updates land at 15 Hz instead of
+/// 30 Hz, the same trade the face chain accepted for expressions.
+pub(crate) const DEFAULT_HAND_EVERY_N: u64 = 2;
 
 fn hand_every_n() -> u64 {
     std::env::var("VULVATAR_HAND_EVERY_N")
@@ -1723,7 +1762,13 @@ impl FusionProvider {
                         }
                     }
                     HAND_WORK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if let Some(mut res) = hl.estimate(rgb_data, width, height, crop) {
+                    let t_infer = std::time::Instant::now();
+                    let estimated = hl.estimate(rgb_data, width, height, crop);
+                    HAND_US[0].fetch_add(
+                        t_infer.elapsed().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    if let Some(mut res) = estimated {
                         res.src = ci as u8;
                         // Presence authority: the calibrated net. Palm
                         // proposals are scored at the PEAK (the decoded
@@ -1786,7 +1831,13 @@ impl FusionProvider {
                         } else {
                             [res.px[0][0], res.px[0][1]]
                         };
-                        if !hand_gate(gate_px, ci, is_palm, res.presence) {
+                        let t_gate = std::time::Instant::now();
+                        let gate_ok = hand_gate(gate_px, ci, is_palm, res.presence);
+                        HAND_US[1].fetch_add(
+                            t_gate.elapsed().as_micros() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        if !gate_ok {
                             if is_palm {
                                 PALM_TALLY[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
@@ -3475,7 +3526,6 @@ mod hand_work_throttle_tests {
     /// becoming the default on a whim.
     #[test]
     fn measured_regressions_ship_disabled() {
-        assert_eq!(DEFAULT_HAND_EVERY_N, 1, "hand chain must run every frame");
         assert_eq!(DEFAULT_HAND_COLD_STRIDE, 1, "stride 3 cost snaps 17 -> 31");
         assert_eq!(
             DEFAULT_HAND_COLD_CANDIDATES, 0,
@@ -3545,5 +3595,23 @@ mod hand_work_throttle_tests {
     #[test]
     fn dedup_ships_enabled() {
         assert!(DEFAULT_HAND_DEDUP_IOU > 0.0);
+    }
+
+    /// The uniform rate halving is what brought the phase inside the 33 ms
+    /// budget (57.0 -> 25.3 ms median on the worst recording) while snaps
+    /// improved and the per-attempt lock rate held. Raising it back to 1
+    /// puts the worst case at ~1.7x budget again.
+    #[test]
+    fn hand_rate_is_halved_by_default() {
+        assert_eq!(DEFAULT_HAND_EVERY_N, 2);
+    }
+
+    /// The stride must stay uniform: `hand_every_n` is unconditional while
+    /// `hand_cold_stride` keys off lock state, and the state-dependent one
+    /// is the variant that made snaps worse. If the cold stride is ever
+    /// re-enabled it must not silently become the effective cadence.
+    #[test]
+    fn cold_stride_does_not_exceed_the_uniform_rate_by_default() {
+        assert!(DEFAULT_HAND_COLD_STRIDE <= DEFAULT_HAND_EVERY_N);
     }
 }

@@ -1119,3 +1119,120 @@ mod wrist_crop_tests {
         assert!(wrist_hand_crop(&kps, 0, 640, 480, 0.35, 96.0).is_none(), "out of frame");
     }
 }
+
+/// Is batching the crop ladder actually faster?
+///
+/// The ladder runs 1.4-5.1 landmark passes per frame at ~14 ms each, and
+/// the export takes `(batch, 3, 256, 256)` with a dynamic batch axis — so
+/// folding the candidates into one forward looks like free speed. It is
+/// only free if the backend actually amortises the batch; DirectML can
+/// re-plan per shape, in which case a batch of 3 costs 3 separate runs
+/// plus a re-optimisation. Measure before refactoring the hot path.
+///
+/// ```powershell
+/// cargo test --lib hand_batch_is_worth_it -- --ignored --nocapture
+/// ```
+#[cfg(test)]
+mod batch_bench {
+    use super::*;
+
+    #[test]
+    #[ignore = "benchmark: needs models/rtmpose-m-hand_256.onnx and a GPU"]
+    fn hand_batch_is_worth_it() {
+        use std::time::Instant;
+        let path = std::path::Path::new("models").join(RTMOSE_HAND_CANDIDATES[0]);
+        if !path.is_file() {
+            eprintln!("skip: {} missing", path.display());
+            return;
+        }
+        let (mut session, backend) =
+            build_session(&path.to_string_lossy(), 2, "RTMPose-hand-bench").expect("session");
+        let input_name = session
+            .inputs()
+            .first()
+            .map(|i| i.name().to_string())
+            .unwrap_or_else(|| "input".to_string());
+        println!("backend {backend:?}");
+
+        let time_batch = |session: &mut ort::session::Session, n: usize| -> f64 {
+            let t = Array4::<f32>::zeros((n, 3, 256, 256));
+            // Warm up: the first run of a shape pays plan construction.
+            for _ in 0..3 {
+                let input = TensorRef::from_array_view(&t).expect("tensor");
+                let _ = session.run(ort::inputs![input_name.as_str() => input]);
+            }
+            let iters = 20;
+            let start = Instant::now();
+            for _ in 0..iters {
+                let input = TensorRef::from_array_view(&t).expect("tensor");
+                let out = session.run(ort::inputs![input_name.as_str() => input]);
+                assert!(out.is_ok(), "batch {n} failed: {:?}", out.err());
+            }
+            start.elapsed().as_secs_f64() * 1000.0 / iters as f64
+        };
+
+        let b1 = time_batch(&mut session, 1);
+        let b2 = time_batch(&mut session, 2);
+        let b3 = time_batch(&mut session, 3);
+        println!("batch1 {b1:.2} ms | batch2 {b2:.2} ms ({:.2}x) | batch3 {b3:.2} ms ({:.2}x)",
+                 b2 / b1, b3 / b1);
+        println!(
+            "per-candidate: 1 -> {b1:.2} ms, 2 -> {:.2} ms, 3 -> {:.2} ms",
+            b2 / 2.0,
+            b3 / 3.0
+        );
+        // The ladder averages ~2.5 candidates, so batching only pays if a
+        // batch of 3 costs clearly less than 3 sequential runs.
+        if b3 < 2.4 * b1 {
+            println!("VERDICT: batching pays (batch3 < 2.4x batch1)");
+        } else {
+            println!("VERDICT: batching does NOT pay on this backend");
+        }
+    }
+
+    /// Where does the per-candidate cost actually go?
+    ///
+    /// The batch bench puts one forward at ~6.7 ms, but the hand phase
+    /// measures 23-56 ms at 1.4-5.1 candidates per frame — so the forward
+    /// is a minority of it and something else scales with candidates. This
+    /// times the two CPU steps that run per candidate before the forward:
+    /// the bilinear crop resample into a 256x256x3 tensor, and the ImageNet
+    /// normalisation pass over it.
+    #[test]
+    #[ignore = "benchmark: CPU cost of the per-candidate crop preparation"]
+    fn where_does_the_per_candidate_time_go() {
+        use crate::tracking::detector::yolo_pose::fill_crop_tensor;
+        use std::time::Instant;
+        let (w, h) = (640u32, 480u32);
+        let rgb = vec![128u8; (w * h * 3) as usize];
+        let mut tensor = Array4::<f32>::zeros((1, 3, 256, 256));
+        let crop = (120.0f32, 90.0f32, 96.0f32);
+        let iters = 200;
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            fill_crop_tensor(&rgb, w, h, crop, &mut tensor);
+        }
+        let fill_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        let start = Instant::now();
+        for _ in 0..iters {
+            let mut view = tensor.view_mut();
+            for c in 0..3 {
+                let (m, sd) = (RTMOSE_MEAN[c], RTMOSE_STD[c]);
+                view.slice_mut(ndarray::s![0, c, .., ..])
+                    .mapv_inplace(|v| (v - m) / sd);
+            }
+        }
+        let norm_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        println!(
+            "per candidate: fill_crop_tensor {fill_ms:.3} ms + normalise {norm_ms:.3} ms = {:.3} ms CPU",
+            fill_ms + norm_ms
+        );
+        println!(
+            "at 2.45 candidates/frame that is {:.2} ms/frame of CPU before any inference",
+            2.45 * (fill_ms + norm_ms)
+        );
+    }
+}
