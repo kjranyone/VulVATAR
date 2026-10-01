@@ -176,7 +176,6 @@ fn main() -> Result<(), String> {
             let Some(skin) = skin else {
                 return *p;
             };
-            let ji = vd.joint_indices.get(vi).copied().unwrap_or([0; 4]);
             let w = vd.joint_weights.get(vi).copied().unwrap_or([1.0, 0.0, 0.0, 0.0]);
             let mut out = [0.0f32; 3];
             for k in 0..4 {
@@ -257,16 +256,14 @@ fn main() -> Result<(), String> {
             let ib = indices[tri * 3 + 1] as usize;
             let ic = indices[tri * 3 + 2] as usize;
             let (pa, pb, pc) = (skinned[ia], skinned[ib], skinned[ic]);
-            let w = |i: usize| 1.0 - u - v;
-            let _ = w;
-            let bary = |vp: &vulvatar_lib::asset::Vec3| {
+            let bary = || {
                 [
                     pa[0] * (1.0 - u - v) + pb[0] * u + pc[0] * v,
                     pa[1] * (1.0 - u - v) + pb[1] * u + pc[1] * v,
                     pa[2] * (1.0 - u - v) + pb[2] * u + pc[2] * v,
                 ]
             };
-            let pos = bary(&pa);
+            let pos = bary();
             // Interpolated shading normal, geometric fallback.
             let mut n = [
                 vd.normals[ia][0] * (1.0 - u - v)
