@@ -1346,7 +1346,7 @@ impl FusionProvider {
             // recording's right hand is half out of frame, which no crop
             // proposal fixes (cost when on: ~+1 inference/frame).
             // `VULVATAR_HAND_DEPTH_BLOBS=1` enables.
-            let depth_blobs: Vec<(f32, f32, f32)> = if std::env::var_os("VULVATAR_HAND_DEPTH_BLOBS").is_some() {
+            let depth_blobs: Vec<super::hands::DepthHandBlob> = if std::env::var_os("VULVATAR_HAND_DEPTH_BLOBS").is_some() {
                 depth
                     .as_ref()
                     .map(|d| super::hands::depth_hand_crops(&d.points_m, d.width, d.height))
@@ -1665,8 +1665,8 @@ impl FusionProvider {
                 // crops because those score 0 at the frame's bottom edge —
                 // where desk hands live.
                 if let Some(bi) = blob_for_hand[hand] {
-                    if let Some(c) = depth_blobs.get(bi).copied() {
-                        candidates.push(c);
+                    if let Some(b) = depth_blobs.get(bi) {
+                        candidates.push(b.crop);
                     }
                 }
                 if let Some(c) =
@@ -3001,6 +3001,61 @@ impl FusionProvider {
                 &mut obs.kp3d,
                 &mut obs.angles,
             );
+        }
+
+        // ---- depth-blob wrist observation (drought frames) --------------------
+        // A desk hand the ladder did not lock has NO wrist evidence: the
+        // keypoint seeds score 0 at the frame's bottom edge, so the arm
+        // chain is prior-driven and drifts (measured on the blink
+        // recording: right-hand data-sigma duty 0.05, FK 0.50 m from the
+        // depth blob). The blob's 3D centroid — the nearest-surface mean,
+        // ~15 cm off the wrist joint along the forearm (Phase-A
+        // measurement, 2026-10-01) — becomes a wide-sigma Kp3d on the
+        // wrist, the exact shape of the wrist-hold observation. Skipped
+        // on frames the slot DID lock (the 21 landmark terms own the
+        // wrist then); the Cauchy kernel absorbs the systematic centroid
+        // offset, and the arm sigma-cap loop downstream applies its usual
+        // cap. `VULVATAR_HAND_DEPTH_OBS=1` (default OFF until the desk
+        // A/B passes: watch torso yaw std — the arm-coupling canary).
+        if std::env::var_os("VULVATAR_HAND_DEPTH_OBS").is_some() {
+            if let Some(d) = depth.as_ref() {
+                let blobs = super::hands::depth_hand_crops(&d.points_m, d.width, d.height);
+                let locked_x = [
+                    self.last_hands[0].as_ref().map(|res| {
+                        let (mut sx, mut n) = (0.0f32, 0usize);
+                        for p in &res.px {
+                            sx += p[0];
+                            n += 1;
+                        }
+                        sx / n.max(1) as f32
+                    }),
+                    self.last_hands[1].as_ref().map(|res| {
+                        let (mut sx, mut n) = (0.0f32, 0usize);
+                        for p in &res.px {
+                            sx += p[0];
+                            n += 1;
+                        }
+                        sx / n.max(1) as f32
+                    }),
+                ];
+                let assign = super::hands::assign_depth_blobs(&blobs, locked_x, width);
+                for (hand, j_wr) in [(0usize, self.h.j.l_wrist), (1usize, self.h.j.r_wrist)] {
+                    if let Some(bi) = assign[hand] {
+                        if let Some(b) = blobs.get(bi) {
+                            obs.kp3d.push(super::estimator::Kp3d {
+                                point: super::estimator::ModelPoint::Joint(j_wr),
+                                p: [
+                                    f64::from(b.centroid_m[0]),
+                                    f64::from(b.centroid_m[1]),
+                                    f64::from(b.centroid_m[2]),
+                                ],
+                                sigma: 0.15,
+                                lat_scale: 2.0,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         // ---- head orientation from the dense FaceMesh pose --------------------

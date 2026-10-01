@@ -1251,11 +1251,21 @@ mod batch_bench {
 /// a plain flood fill (~19k cells, sub-ms). Returns at most two crop
 /// windows `(x0, y0, size)`, leftmost first; the caller assigns them to
 /// slots by x proximity.
+/// A depth-blob hand proposal: the crop window the landmark ladder
+/// samples, plus the blob's 3D centroid in camera space (mean xyz of the
+/// blob's near pixels — `points_m` is already metric) for the wrist 3D
+/// observation (`VULVATAR_HAND_DEPTH_OBS`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DepthHandBlob {
+    pub crop: (f32, f32, f32),
+    pub centroid_m: [f32; 3],
+}
+
 pub(crate) fn depth_hand_crops(
     points_m: &[[f32; 3]],
     width: u32,
     height: u32,
-) -> Vec<(f32, f32, f32)> {
+) -> Vec<DepthHandBlob> {
     const DS: usize = 4;
     const NEAR_MARGIN_M: f32 = 0.10;
     // ~200 px full-res (a fist at the blob edge) .. ~13k px (hand +
@@ -1299,58 +1309,85 @@ pub(crate) fn depth_hand_crops(
             }
         }
     }
-    let mut seen = vec![false; gw * gh];
-    let mut blobs: Vec<((f32, f32, f32), f32)> = Vec::new();
-    for start in 0..mask.len() {
-        if !mask[start] || seen[start] {
-            continue;
-        }
-        let mut stack = vec![start];
-        seen[start] = true;
-        let mut cells: Vec<usize> = Vec::new();
-        while let Some(i) = stack.pop() {
-            cells.push(i);
-            let x = i % gw;
-            let y = i / gw;
-            let neighbours = [
-                x.checked_add(1).map(|nx| (nx, y)),
-                x.checked_sub(1).map(|nx| (nx, y)),
-                Some((x, y + 1)),
-                y.checked_sub(1).map(|ny| (x, ny)),
-            ];
-            for n in neighbours.into_iter().flatten() {
-                let (nx, ny) = n;
-                if nx < gw && ny < gh {
-                    let j = ny * gw + nx;
-                    if mask[j] && !seen[j] {
-                        seen[j] = true;
-                        stack.push(j);
+        let mut seen = vec![false; gw * gh];
+        let mut blobs: Vec<(DepthHandBlob, f32)> = Vec::new();
+        for start in 0..mask.len() {
+            if !mask[start] || seen[start] {
+                continue;
+            }
+            let mut stack = vec![start];
+            seen[start] = true;
+            let mut cells: Vec<usize> = Vec::new();
+            while let Some(i) = stack.pop() {
+                cells.push(i);
+                let x = i % gw;
+                let y = i / gw;
+                let neighbours = [
+                    x.checked_add(1).map(|nx| (nx, y)),
+                    x.checked_sub(1).map(|nx| (nx, y)),
+                    Some((x, y + 1)),
+                    y.checked_sub(1).map(|ny| (x, ny)),
+                ];
+                for n in neighbours.into_iter().flatten() {
+                    let (nx, ny) = n;
+                    if nx < gw && ny < gh {
+                        let j = ny * gw + nx;
+                        if mask[j] && !seen[j] {
+                            seen[j] = true;
+                            stack.push(j);
+                        }
                     }
                 }
             }
+            if cells.len() < MIN_CELLS || cells.len() > MAX_CELLS {
+                continue;
+            }
+            let (mut sx, mut sy) = (0.0f32, 0.0f32);
+            for &i in &cells {
+                sx += (i % gw) as f32;
+                sy += (i / gw) as f32;
+            }
+            let n = cells.len() as f32;
+            let cx = (sx / n + 0.5) * DS as f32;
+            let cy = (sy / n + 0.5) * DS as f32;
+            let size = ((n.sqrt() * DS as f32) * 1.6).clamp(96.0, 320.0);
+            let crop = (
+                (cx - 0.5 * size).clamp(0.0, (w as f32 - size).max(0.0)),
+                (cy - 0.5 * size).clamp(0.0, (h as f32 - size).max(0.0)),
+                size,
+            );
+            // 3D centroid: mean xyz over the blob's near samples
+            // (points_m is metric camera space — no unprojection needed).
+            let (mut sum, mut cnt) = ([0.0f64; 3], 0usize);
+            for &i in &cells {
+                for dy in 0..DS {
+                    for dx in 0..DS {
+                        let p = points_m[(i / gw * DS + dy) * w + (i % gw) * DS + dx];
+                        // NEAR samples only: the dilated cell mask lets
+                        // torso-depth and NaN samples through, and a
+                        // centroid mixing those is the torso, not the hand.
+                        if p[2].is_finite() && p[2] > 0.05 && p[2] < z_near {
+                            for k in 0..3 {
+                                sum[k] += f64::from(p[k]);
+                            }
+                            cnt += 1;
+                        }
+                    }
+                }
+            }
+            if cnt < 32 {
+                continue;
+            }
+            let centroid_m = [
+                (sum[0] / cnt as f64) as f32,
+                (sum[1] / cnt as f64) as f32,
+                (sum[2] / cnt as f64) as f32,
+            ];
+            blobs.push((DepthHandBlob { crop, centroid_m }, cx));
         }
-        if cells.len() < MIN_CELLS || cells.len() > MAX_CELLS {
-            continue;
-        }
-        let (mut sx, mut sy) = (0.0f32, 0.0f32);
-        for &i in &cells {
-            sx += (i % gw) as f32;
-            sy += (i / gw) as f32;
-        }
-        let n = cells.len() as f32;
-        let cx = (sx / n + 0.5) * DS as f32;
-        let cy = (sy / n + 0.5) * DS as f32;
-        let size = ((n.sqrt() * DS as f32) * 1.6).clamp(96.0, 320.0);
-        let crop = (
-            (cx - 0.5 * size).clamp(0.0, (w as f32 - size).max(0.0)),
-            (cy - 0.5 * size).clamp(0.0, (h as f32 - size).max(0.0)),
-            size,
-        );
-        blobs.push((crop, cx));
+        blobs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        blobs.into_iter().take(2).map(|(b, _)| b).collect()
     }
-    blobs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-    blobs.into_iter().take(2).map(|(crop, _)| crop).collect()
-}
 
 #[cfg(test)]
 mod depth_blob_tests {
@@ -1370,13 +1407,13 @@ mod depth_blob_tests {
                 } else {
                     3.0
                 };
-                pts[y * w + x][2] = z;
+                pts[y * w + x] = [x as f32, y as f32, z];
             }
         }
         for &(bx, by) in &[(160usize, 400usize), (480, 400)] {
             for y in by - 12..by + 12 {
                 for x in bx - 18..bx + 18 {
-                    pts[y * w + x][2] = 0.45;
+                    pts[y * w + x] = [x as f32, y as f32, 0.45];
                 }
             }
         }
@@ -1385,11 +1422,17 @@ mod depth_blob_tests {
 
     #[test]
     fn desk_hands_become_two_left_to_right_proposals() {
-        let crops = depth_hand_crops(&synth_frame(), 640, 480);
-        assert_eq!(crops.len(), 2, "both desk hands found: {crops:?}");
-        assert!(crops[0].0 < crops[1].0, "leftmost first: {crops:?}");
-        for c in &crops {
-            assert!((96.0..=320.0).contains(&c.2), "hand-scale crop: {c:?}");
+        let blobs = depth_hand_crops(&synth_frame(), 640, 480);
+        assert_eq!(blobs.len(), 2, "both desk hands found: {blobs:?}");
+        assert!(blobs[0].crop.0 < blobs[1].crop.0, "leftmost first: {blobs:?}");
+        for b in &blobs {
+            assert!((96.0..=320.0).contains(&b.crop.2), "hand-scale crop: {b:?}");
+            // The synthetic blobs sit at z 0.45 m; the centroid must land
+            // within a few cm of it (it feeds the wrist 3D observation).
+            assert!(
+                (b.centroid_m[2] - 0.45).abs() < 0.05,
+                "centroid z near the blob depth: {b:?}"
+            );
         }
     }
 
@@ -1400,5 +1443,97 @@ mod depth_blob_tests {
         let (w, h) = (640usize, 480usize);
         let pts = vec![[0.0f32, 0.0, 0.45]; w * h];
         assert!(depth_hand_crops(&pts, 640, 480).is_empty());
+    }
+}
+
+/// Assign at most two depth blobs to the two hand slots for the wrist 3D
+/// observation (`VULVATAR_HAND_DEPTH_OBS`). `locked_x[hand]` is the slot's
+/// published hand x this frame (None = drought — nothing locked).
+///
+/// Rules:
+/// * two blobs, both slots drought -> x-order (left blob is the left
+///   hand);
+/// * one blob + a drought slot -> the blob goes to the drought slot only
+///   if it is plausibly theirs (farther than a quarter frame from the
+///   locked hand's x); a blob sitting ON the tracked hand belongs to it,
+///   and constraining the drought wrist to the other hand's position is
+///   the exact wrong-slot damage the assignment exists to prevent;
+/// * no drought -> no observation (the landmark terms own both wrists).
+pub(crate) fn assign_depth_blobs(
+    blobs: &[DepthHandBlob],
+    locked_x: [Option<f32>; 2],
+    width: u32,
+) -> [Option<usize>; 2] {
+    if blobs.is_empty() {
+        return [None, None];
+    }
+    let cx = |i: usize| blobs[i].crop.0 + 0.5 * blobs[i].crop.2;
+    let drought: Vec<usize> = (0..2usize).filter(|h| locked_x[*h].is_none()).collect();
+    let mut out: [Option<usize>; 2] = [None, None];
+    match (blobs.len(), drought.len()) {
+        (_, 0) => {}
+        (1, 1) => {
+            let d = drought[0];
+            let locked = 1 - d;
+            let lx = locked_x[locked].unwrap_or(f32::NAN);
+            let far_enough = !((cx(0) - lx).abs() < width as f32 * 0.25);
+            if far_enough {
+                out[d] = Some(0);
+            }
+        }
+        (1, _) => {
+            // both slots drought, one blob: left half -> slot 0
+            let slot = if cx(0) < width as f32 * 0.5 { 0 } else { 1 };
+            out[slot] = Some(0);
+        }
+        _ => {
+            // two (or more) blobs: x-order
+            out[0] = Some(0);
+            out[1] = Some(1);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod depth_blob_assign_tests {
+    use super::*;
+
+    fn blob(x: f32) -> DepthHandBlob {
+        DepthHandBlob {
+            crop: (x - 48.0, 380.0, 96.0),
+            centroid_m: [0.0, 0.0, 0.45],
+        }
+    }
+
+    #[test]
+    fn two_blobs_go_x_order_to_drought_slots() {
+        let blobs = vec![blob(150.0), blob(500.0)];
+        let a = assign_depth_blobs(&blobs, [None, None], 640);
+        assert_eq!(a, [Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn single_blob_near_tracked_hand_is_not_claimed() {
+        // The left slot is locked at x 150 and the only blob sits on it —
+        // feeding it to the drought right wrist would pin the right wrist
+        // to the left hand (the wrong-slot damage this guard exists for).
+        let blobs = vec![blob(150.0)];
+        let a = assign_depth_blobs(&blobs, [Some(150.0), None], 640);
+        assert_eq!(a, [None, None]);
+    }
+
+    #[test]
+    fn single_blob_far_from_tracked_hand_goes_to_drought_slot() {
+        let blobs = vec![blob(500.0)];
+        let a = assign_depth_blobs(&blobs, [Some(150.0), None], 640);
+        assert_eq!(a, [None, Some(0)]);
+    }
+
+    #[test]
+    fn no_drought_no_observation() {
+        let blobs = vec![blob(150.0), blob(500.0)];
+        let a = assign_depth_blobs(&blobs, [Some(150.0), Some(500.0)], 640);
+        assert_eq!(a, [None, None]);
     }
 }
