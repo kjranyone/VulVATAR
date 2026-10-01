@@ -292,7 +292,14 @@ impl FaceRtmpose {
             return p;
         }
         if let Some(root) = script.parent().and_then(Path::parent) {
-            for rel in [".venv/Scripts/python.exe", ".venv/bin/python"] {
+            for rel in [
+                // dev.ps1's Install-FaceSidecarEnv layout
+                "tools/face98-venv/Scripts/python.exe",
+                "tools/face98-venv/bin/python",
+                // generic repo-local venv layout
+                ".venv/Scripts/python.exe",
+                ".venv/bin/python",
+            ] {
                 let candidate = root.join(rel);
                 if candidate.is_file() {
                     return candidate.to_string_lossy().into_owned();

@@ -83,3 +83,6 @@ models/*.npy
 models/*.bak
 models/*.json
 models/*bak
+
+# repo-local python venv (dev.ps1 Install-PythonDeps)
+.venv/

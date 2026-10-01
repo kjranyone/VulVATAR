@@ -12,7 +12,9 @@ Protocol on stdin/stdout (length-prefixed, little-endian u32):
 "quit" (raw, no length prefix) terminates. The model is loaded once at
 startup; inference is ~30-60 ms/frame on CPU (XNNPACK).
 
-Install: pip install ai-edge-litert
+Install: the repo's requirements.txt is the single dependency source —
+bootstrap with dev.ps1's "python deps" entry (creates .venv). The app
+prefers .venv's python; VULVATAR_FACE_SIDECAR_PYTHON overrides.
 """
 import os
 import struct
