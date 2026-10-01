@@ -1254,23 +1254,11 @@ impl Model {
         c.base_radius * st.rad_mul(c.rad_group)
     }
 
-    /// Depth (camera-facing) semi-axis: the lateral radius for a round
-    /// capsule, `radius × aspect` for an elliptic one. Occlusion tests use
-    /// this — the conservative extent toward the camera.
-    pub fn capsule_depth_radius(&self, st: &State, c: &CapsuleDef) -> f64 {
-        self.capsule_radius(st, c) * self.capsule_aspect(st, c)
-    }
-
     /// Shape-fitted multiplier on an elliptic capsule's `aspect` (1.0 =
     /// as authored). Only the trunk carries an `aspect_group`.
     #[inline]
     pub fn capsule_aspect(&self, st: &State, c: &CapsuleDef) -> f64 {
         c.aspect_group.map(|g| st.rad_mul(g)).unwrap_or(1.0) * c.aspect
-    }
-
-    /// Joint index whose `bone` equals `b`, if any.
-    pub fn joint_for_bone(&self, b: HumanoidBone) -> Option<usize> {
-        self.joints.iter().position(|j| j.bone == Some(b))
     }
 }
 

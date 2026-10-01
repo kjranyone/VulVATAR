@@ -67,15 +67,6 @@ impl RetargetState {
         self.one_euro_bones.clear();
         self.one_euro_hips_t.reset();
     }
-    /// Forget only the display-smoothing state (avatar swap).
-    pub fn reset_smoothing(&mut self) {
-        self.prev_local.clear();
-        self.prev_hips_translation = None;
-        self.rest_cache_len = 0;
-        self.arelax_local.clear();
-        self.one_euro_bones.clear();
-        self.one_euro_hips_t.reset();
-    }
 
     /// Seed the display smoothing from an externally-produced pose (the
     /// idle A-pose relax) so the next tracked frame's slerp starts from

@@ -359,17 +359,24 @@ pub struct DetectionAnnotation {
     pub skeleton: Vec<(usize, usize)>,
     /// Bounding box (min_x, min_y, max_x, max_y) in normalised coords.
     pub bounding_box: Option<(f32, f32, f32, f32)>,
-    /// Per-hand observability: the crop each hand landmarker ran on
+    /// Per-hand observability: the crop each hand stage attempt ran on
     /// (normalised x, y, w, h) and the lock presence, `[left, right]`.
     /// `None` = no crop attempted / no lock this frame.
     pub hand_crops: [Option<HandCropDiag>; 2],
+    /// Face-sidecar landmarks (WFLW-98 order) as (x, y, confidence) in
+    /// normalised [0, 1] image coords. These are the measured points the
+    /// head pose, expressions and face-shape learning are driven from —
+    /// the avatar-facing face inference, surfaced for the wipe. The
+    /// COCO-Wholebody face block above stays unused: no writer fills
+    /// 23..91 and the 98-point layout has no 68-point mapping.
+    pub face_points: Vec<(f32, f32, f32)>,
 }
 
-/// One hand-landmarker attempt, as surfaced on the preview wipe.
+/// One hand-stage attempt, as surfaced on the preview wipe.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HandCropDiag {
     /// Crop rect in normalised frame coords (x, y, w, h).
     pub rect: (f32, f32, f32, f32),
-    /// Landmarker presence for the best attempt on this crop (0..1).
+    /// Hand-chain presence for the best attempt on this crop (0..1).
     pub presence: f32,
 }

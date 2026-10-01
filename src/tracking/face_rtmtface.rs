@@ -285,18 +285,20 @@ impl FaceRtmpose {
     }
 
     /// Python interpreter for the sidecar: VULVATAR_FACE_SIDECAR_PYTHON
-    /// wins, then the repo-local venv bootstrapped by dev.ps1 from
-    /// requirements.txt (`<scripts>/../.venv`), then PATH's "python".
+    /// wins, then the venv provisioned from requirements.txt by dev.ps1
+    /// or app-internal provisioning (`tools/face98-venv`), then the
+    /// legacy repo-local `.venv` layout, then PATH's "python".
     fn resolve_sidecar_python(script: &Path) -> String {
         if let Ok(p) = std::env::var("VULVATAR_FACE_SIDECAR_PYTHON") {
             return p;
         }
         if let Some(root) = script.parent().and_then(Path::parent) {
             for rel in [
-                // dev.ps1's Install-FaceSidecarEnv layout
+                // dev.ps1 / app provisioning layout (requirements.txt)
                 "tools/face98-venv/Scripts/python.exe",
                 "tools/face98-venv/bin/python",
-                // generic repo-local venv layout
+                // legacy generic repo-local venv layout (not created by
+                // anything anymore; honoured if it exists)
                 ".venv/Scripts/python.exe",
                 ".venv/bin/python",
             ] {
@@ -437,15 +439,16 @@ impl FaceRtmpose {
     }
 
     /// Run the face chain on one frame. Returns the synthesized dense
-    /// 478 mesh (frame px), a confidence, the geometric expressions and
-    /// the head pose derived from the measured landmarks.
+    /// 478 mesh (frame px), a confidence, the geometric expressions,
+    /// the head pose derived from the measured landmarks, and the
+    /// measured 98 WFLW landmarks in frame px (see [`FaceOutput`]).
     pub fn estimate(
         &mut self,
         rgb: &[u8],
         width: u32,
         height: u32,
         bbox: (f32, f32, f32),
-    ) -> Option<(Vec<SourceExpression>, f32, Option<FacePose>, Vec<[f32; 3]>)> {
+    ) -> Option<FaceOutput> {
         let (bx, by, size) = bbox;
         if size < 40.0 {
             if std::env::var_os("VULVATAR_FACE_DEBUG").is_some() {
@@ -599,7 +602,12 @@ impl FaceRtmpose {
             }
         }
         let pose = self.derive_pose(&pts_frame);
-        Some((exprs, conf, pose, mesh478))
+        // Frame-px 98 for the GUI wipe (f64 internals → f32 payload).
+        let pts98: Vec<[f32; 2]> = pts_frame
+            .iter()
+            .map(|p| [p[0] as f32, p[1] as f32])
+            .collect();
+        Some((exprs, conf, pose, mesh478, pts98))
     }
 
     fn ring_ratio(&mut self, pts: &[[f64; 2]], ring: (usize, usize), eye: usize) -> f32 {
@@ -865,7 +873,7 @@ mod tests {
         assert!(open_v < 0.2, "open eye {open_v} should read as not-blinking");
 
         // jaw: a flat mouth line reads closed; a tall ring reads open
-        let mut shut = face.geometric_expressions(&open);
+        let shut = face.geometric_expressions(&open);
         let jaw_shut = shut.iter().find(|e| e.name == "jawOpen").unwrap().weight;
         assert!(jaw_shut < 0.2, "flat mouth jawOpen {jaw_shut}");
         let open_mouth: Vec<[f64; 2]> = open
@@ -922,12 +930,16 @@ struct FaceJob {
 }
 
 /// Latest completed face result from the worker thread: the frame whose
-/// crop produced it and the full `FaceRtmpose::estimate` output.
+/// crop produced it and the full `FaceRtmpose::estimate` output. The 5th
+/// element carries the measured 98 WFLW landmarks in frame pixels — the
+/// points every downstream consumer (pose, expressions, mesh learning)
+/// is ultimately derived from — for the GUI wipe annotation.
 pub type FaceOutput = (
     Vec<crate::tracking::SourceExpression>,
     f32,
     Option<crate::tracking::FacePose>,
     Vec<[f32; 3]>,
+    Vec<[f32; 2]>,
 );
 
 /// Asynchronous face-chain runner: the detector thread submits 256×256

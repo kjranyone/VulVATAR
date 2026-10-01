@@ -46,11 +46,6 @@ impl OutputFrame {
         }
     }
 
-    pub fn with_pixel_data(mut self, data: Arc<Vec<u8>>) -> Self {
-        self.pixel_data = Some(data);
-        self
-    }
-
     pub fn with_gpu_token(mut self, token: GpuFrameToken) -> Self {
         self.gpu_token = Some(token);
         self.handoff_path = HandoffPath::GpuSharedFrame;
@@ -84,7 +79,6 @@ pub struct OutputRouter {
     policy: FrameSinkQueuePolicy,
     queue: VecDeque<OutputFrame>,
     max_queue_depth: usize,
-    next_frame_id: u64,
     dropped_count: u64,
     /// Frames skipped by the router's own forward-throttle
     /// (`forward_min_interval`). Deliberate pacing, not loss — kept out of
@@ -163,7 +157,6 @@ impl OutputRouter {
             policy: FrameSinkQueuePolicy::ReplaceLatest,
             queue: VecDeque::new(),
             max_queue_depth: 2,
-            next_frame_id: 0,
             dropped_count: 0,
             throttled_count: 0,
             last_publish_timestamp: 0,
@@ -528,27 +521,6 @@ impl OutputRouter {
                     }
                 }
             }
-        }
-    }
-
-    pub fn create_frame(
-        &mut self,
-        width: u32,
-        height: u32,
-        timestamp: FrameTimestamp,
-    ) -> OutputFrame {
-        let id = self.next_frame_id;
-        self.next_frame_id += 1;
-        OutputFrame {
-            frame_id: OutputFrameId(id),
-            timestamp,
-            extent: [width, height],
-            color_space: OutputColorSpace::Srgb,
-            alpha_mode: AlphaMode::Premultiplied,
-            gpu_token: None,
-            handoff_path: HandoffPath::CpuReadback,
-            fallback_reason: Some(FallbackReason::RequestedCpuReadback),
-            pixel_data: None,
         }
     }
 

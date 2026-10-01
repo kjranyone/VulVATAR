@@ -24,7 +24,7 @@
 //!     changed)
 //!  4. source SHA-256 (if size+mtime didn't match, we recompute)
 
-use crate::asset::{AssetSourceHash, AvatarAsset};
+use crate::asset::AvatarAsset;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -311,13 +311,6 @@ fn compute_source_hash(source_path: &Path) -> Result<[u8; 32], String> {
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     Ok(out)
-}
-
-/// Re-compute the hash for an asset that was loaded from cache. Used by
-/// the loader after rehydrating textures, in case the assets get a
-/// runtime ID assigned that differs from what was cached.
-pub fn rehash_source(source_path: &Path) -> Option<AssetSourceHash> {
-    compute_source_hash(source_path).ok().map(AssetSourceHash)
 }
 
 // ---------------------------------------------------------------------------

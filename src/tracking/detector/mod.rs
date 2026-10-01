@@ -1,12 +1,11 @@
 //! The pose detector stage: Ultralytics YOLO26-pose (single-stage
 //! whole-frame person + COCO-17) plus the shared perception pieces every
-//! detector feeds — the 133-entry COCO-Wholebody keypoint record, the
-//! MediaPipe face-cascade orchestration, and the DirectML/CPU session
-//! builder.
+//! detector feeds — the 133-entry COCO-Wholebody keypoint record and the
+//! DirectML/CPU session builder.
 //!
 //! Replaced RTMW3D (SimCC wholebody, 2026-09): the fusion estimator's
-//! contract (`DetectorAux` — 133 keypoints + FaceMesh landmarks + person
-//! crop) is unchanged; YOLO26 fills the body-17 block and the estimator's
+//! contract (`DetectorAux` — 133 keypoints + person crop) is unchanged;
+//! YOLO26 fills the body-17 block and the estimator's
 //! visibility calibration takes over the rest. See `yolo26.rs` for the
 //! score/σ calibration notes and `docs/tracking-v2-design.md` for the
 //! estimator side.

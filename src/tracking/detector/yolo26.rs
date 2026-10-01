@@ -85,12 +85,7 @@ pub(crate) struct Yolo26PoseInference {
     /// Capture timestamp of the last face run.
     last_face_ts_ms: f64,
     /// Last accepted face result, republished on skipped frames.
-    last_face: Option<(
-        Vec<crate::tracking::SourceExpression>,
-        f32,
-        Option<crate::tracking::FacePose>,
-        Vec<[f32; 3]>,
-    )>,
+    last_face: Option<crate::tracking::face_rtmtface::FaceOutput>,
     face_selector: face::FaceSourceSelector,
     frame_timestamp_ms: Option<f64>,
     frame_dt: crate::tracking::metric_frame::FrameDtTracker,
@@ -407,7 +402,7 @@ impl Yolo26PoseInference {
             if let Some(result) = face_worker.take_newer(&mut self.last_face_seen) {
                 self.last_face = Some(result);
             }
-            if let Some((exprs, conf, pose, mesh478)) = self.last_face.as_ref() {
+            if let Some((exprs, conf, pose, mesh478, _pts98)) = self.last_face.as_ref() {
                 skeleton.expressions = exprs.clone();
                 skeleton.face_mesh_confidence = Some(*conf);
                 mesh_conf = *conf;
@@ -431,6 +426,13 @@ impl Yolo26PoseInference {
                 p[3] / height as f32,
             )
         });
+        // The face sidecar's measured landmarks ride along for the wipe:
+        // these are the points the avatar's head pose, expressions and
+        // face-shape learning are driven from. Empty when the sidecar is
+        // absent or the latest fit was rejected.
+        if let Some((_, face_conf, _, _, face_pts)) = self.last_face.as_ref() {
+            annotation::fill_face_annotation(&mut detection, face_pts, *face_conf, width, height);
+        }
 
         debug!(
             "YOLO26-pose timing: total={:>5.1}ms det={:>5.1}ms person={}",

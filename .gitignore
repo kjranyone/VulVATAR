@@ -59,6 +59,9 @@ __pycache__/
 *.stdout.log
 *.stderr.log
 
+# Image-sequence output dir created by the frame sink at runtime
+/output_frames/
+
 # Inno Setup installer build output
 /installer/output/
 
@@ -94,5 +97,6 @@ models/*bak
 !models/mp_canonical478.npy
 !models/mp_wflw98_idx.json
 
-# repo-local python venv (dev.ps1 Install-PythonDeps)
+# legacy repo-local python venv layout (nothing creates it anymore;
+# resolve_sidecar_python still honours it if present)
 .venv/

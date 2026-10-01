@@ -2,7 +2,7 @@
 //!
 //! Loads one image, builds the pose provider, runs `estimate_pose`
 //! N times, and reports per-iteration wall time. Same warm-up +
-//! steady-state convention as `bench_pose` but targeting the provider
+//! steady-state convention as `bench_render` but targeting the provider
 //! abstraction so the full pipeline (detector + fusion estimator) is
 //! measured with the same harness.
 //!

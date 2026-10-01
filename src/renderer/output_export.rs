@@ -3,7 +3,6 @@ use crate::frame_handoff::{
     HandoffPath, OutputSyncToken,
 };
 use crate::renderer::frame_input::{OutputTargetRequest, RenderColorSpace, RenderExportMode};
-use crate::renderer::frame_pool::FramePool;
 use crate::renderer::gpu_handle::{GpuHandleExporter, SharedHandle};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -256,7 +255,6 @@ pub struct OutputExporter {
     export_count: u64,
     gpu_handle_exporter: GpuHandleExporter,
     released_tokens: HashSet<u64>,
-    frame_pool: FramePool,
     export_image_pool: ExportImagePool,
 }
 
@@ -272,7 +270,6 @@ impl OutputExporter {
             export_count: 0,
             gpu_handle_exporter: GpuHandleExporter::new(),
             released_tokens: HashSet::new(),
-            frame_pool: FramePool::new(2),
             export_image_pool: ExportImagePool::new(DEFAULT_EXPORT_IMAGE_POOL_CAPACITY),
         }
     }
@@ -280,29 +277,12 @@ impl OutputExporter {
     pub fn release_token(&mut self, lease_id: u64) {
         log::info!("output-export: release_token({})", lease_id);
         self.released_tokens.insert(lease_id);
-        self.frame_pool.release(lease_id);
         if !self.export_image_pool.release_lease(lease_id) {
             log::warn!(
                 "output-export: release_token({}) did not match an active GPU lease",
                 lease_id
             );
         }
-    }
-
-    pub fn is_token_released(&self, token_id: u64) -> bool {
-        self.released_tokens.contains(&token_id)
-    }
-
-    pub fn released_token_count(&self) -> usize {
-        self.released_tokens.len()
-    }
-
-    pub fn frame_pool(&self) -> &FramePool {
-        &self.frame_pool
-    }
-
-    pub fn frame_pool_mut(&mut self) -> &mut FramePool {
-        &mut self.frame_pool
     }
 
     pub fn export_image_pool(&self) -> &ExportImagePool {

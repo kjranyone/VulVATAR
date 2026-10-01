@@ -5,7 +5,6 @@ pub mod debug;
 mod draw_pass;
 pub mod frame_input;
 mod frame_plan;
-pub mod frame_pool;
 mod gpu_alloc;
 pub mod gpu_handle;
 mod gpu_wait;

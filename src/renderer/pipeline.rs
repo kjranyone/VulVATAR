@@ -1,5 +1,4 @@
-use crate::renderer::frame_input::{RenderAlphaMode, RenderCullMode};
-use crate::renderer::material::MaterialShaderMode;
+use crate::renderer::frame_input::RenderAlphaMode;
 use std::sync::Arc;
 use vulkano::device::Device;
 use vulkano::image::SampleCount;
@@ -2088,55 +2087,6 @@ impl PipelineState {
             active_pipeline: pipeline,
             initialized: false,
             graphics_pipeline: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct PipelineKey {
-    pub material_mode: MaterialShaderMode,
-    pub alpha_mode: RenderAlphaMode,
-    pub outline_enabled: bool,
-    pub cull_mode: RenderCullMode,
-    pub vertex_layout: VertexLayout,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub enum VertexLayout {
-    #[default]
-    Skinned,
-    Static,
-}
-
-impl PipelineKey {
-    pub fn select_pipeline(&self) -> RenderPipeline {
-        if self.outline_enabled {
-            return RenderPipeline::Outline;
-        }
-        match self.material_mode {
-            MaterialShaderMode::Unlit => RenderPipeline::SkinningUnlit,
-            MaterialShaderMode::SimpleLit => RenderPipeline::SkinningSimpleLit,
-            MaterialShaderMode::ToonLike => RenderPipeline::SkinningToon,
-        }
-    }
-
-    pub fn from_mesh_instance(
-        material_mode: MaterialShaderMode,
-        alpha_mode: RenderAlphaMode,
-        cull_mode: RenderCullMode,
-        outline_enabled: bool,
-        has_skin: bool,
-    ) -> Self {
-        Self {
-            material_mode,
-            alpha_mode,
-            outline_enabled,
-            cull_mode,
-            vertex_layout: if has_skin {
-                VertexLayout::Skinned
-            } else {
-                VertexLayout::Static
-            },
         }
     }
 }

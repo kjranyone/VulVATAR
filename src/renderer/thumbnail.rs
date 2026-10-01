@@ -47,10 +47,6 @@ impl ThumbnailGenerator {
         &self.output_dir
     }
 
-    pub fn set_output_dir(&mut self, dir: PathBuf) {
-        self.output_dir = dir;
-    }
-
     pub fn generate_placeholder(&self, request: &ThumbnailRequest) -> ThumbnailResult {
         let w = request.width.max(1) as usize;
         let h = request.height.max(1) as usize;

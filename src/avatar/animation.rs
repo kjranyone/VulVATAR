@@ -44,15 +44,6 @@ impl AnimationState {
     pub fn reset(&mut self) {
         self.playhead_seconds = 0.0;
     }
-
-    /// Returns a normalized sample position in `[0, 1]` given the clip
-    /// duration.  Useful for sampling keyframes.
-    pub fn normalized_time(&self, clip_duration: f32) -> f32 {
-        if clip_duration <= 0.0 {
-            return 0.0;
-        }
-        (self.playhead_seconds / clip_duration).clamp(0.0, 1.0)
-    }
 }
 
 // ---------------------------------------------------------------------------

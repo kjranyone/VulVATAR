@@ -13,8 +13,10 @@ Protocol on stdin/stdout (length-prefixed, little-endian u32):
 startup; inference is ~30-60 ms/frame on CPU (XNNPACK).
 
 Install: the repo's requirements.txt is the single dependency source —
-bootstrap with dev.ps1's "python deps" entry (creates .venv). The app
-prefers .venv's python; VULVATAR_FACE_SIDECAR_PYTHON overrides.
+dev.ps1's Install-FaceSidecarEnv installs it into tools/face98-venv
+(the app's built-in provisioning creates the same venv). The app
+resolves tools/face98-venv's python first; VULVATAR_FACE_SIDECAR_PYTHON
+overrides.
 """
 import os
 import struct

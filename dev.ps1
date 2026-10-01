@@ -285,9 +285,11 @@ function Install-FaceSidecarEnv {
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path $venvPython)) {
         throw "could not create tools\face98-venv (needs python or py -3 on PATH)"
     }
-    & $venvPython -m pip install --quiet ai-edge-litert numpy
+    # requirements.txt is the single dependency source (see its header);
+    # the app-internal provisioning mirrors the same list.
+    & $venvPython -m pip install --quiet -r requirements.txt
     if ($LASTEXITCODE -ne 0) {
-        throw "pip install ai-edge-litert numpy failed - the face sidecar cannot run without it"
+        throw "pip install -r requirements.txt failed - the face sidecar cannot run without it"
     }
     Write-Host "  face sidecar venv ready: $venvPython" -ForegroundColor Green
 }

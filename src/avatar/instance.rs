@@ -416,14 +416,6 @@ impl AvatarInstance {
         self.cloth_overlays.len()
     }
 
-    pub fn get_cloth_overlay(&self, index: usize) -> Option<&ClothOverlaySlot> {
-        self.cloth_overlays.get(index)
-    }
-
-    pub fn get_cloth_overlay_mut(&mut self, index: usize) -> Option<&mut ClothOverlaySlot> {
-        self.cloth_overlays.get_mut(index)
-    }
-
     pub fn build_base_pose(&mut self) {
         let skeleton = &self.asset.skeleton;
         for (i, node) in skeleton.nodes.iter().enumerate() {

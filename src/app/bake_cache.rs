@@ -151,13 +151,6 @@ impl BakeCacheManager {
             .collect()
     }
 
-    pub fn find_by_type(&self, cache_type: &BakeCacheType) -> Vec<&BakeCacheEntry> {
-        self.catalog
-            .iter()
-            .filter(|e| &e.cache_type == cache_type)
-            .collect()
-    }
-
     pub fn purge_entry(&mut self, avatar_name: &str, cache_type: &BakeCacheType) -> usize {
         let before = self.catalog.len();
         self.catalog
@@ -167,15 +160,6 @@ impl BakeCacheManager {
             let _ = self.save_catalog();
         }
         removed
-    }
-
-    pub fn purge_all(&mut self) -> usize {
-        let count = self.catalog.len();
-        self.catalog.clear();
-        let _ = std::fs::remove_dir_all(&self.config.output_dir);
-        let _ = std::fs::create_dir_all(&self.config.output_dir);
-        let _ = self.save_catalog();
-        count
     }
 
     fn load_catalog(dir: &Path) -> Vec<BakeCacheEntry> {

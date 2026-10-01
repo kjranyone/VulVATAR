@@ -203,14 +203,6 @@ impl VrmAssetLoader {
         Ok(asset)
     }
 
-    pub fn load_from_bytes(
-        &self,
-        data: &[u8],
-        source_path: PathBuf,
-    ) -> Result<Arc<AvatarAsset>, VrmLoadError> {
-        self.load_from_bytes_with_progress(data, source_path, |_| {})
-    }
-
     pub fn load_from_bytes_with_progress(
         &self,
         data: &[u8],

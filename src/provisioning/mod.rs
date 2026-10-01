@@ -618,6 +618,47 @@ mod tests {
         assert_eq!(ids.len(), total, "manifest ids double as i18n keys");
     }
 
+    /// requirements.txt is the declared single source for the sidecar
+    /// venv's packages, but pip has no `-r` mode in `ProvisionJob`, so
+    /// the manifest carries a hard-coded copy. If the two drift, the venv
+    /// provisions "successfully" while the sidecar dies on import every
+    /// frame — pin them together.
+    #[test]
+    fn sidecar_venv_packages_match_requirements() {
+        let txt = std::fs::read_to_string("requirements.txt")
+            .expect("requirements.txt missing from the package root");
+        let declared: Vec<String> = txt
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            !declared.is_empty(),
+            "requirements.txt parsed to an empty package list"
+        );
+        let provisioned: Vec<&str> = manifest()
+            .iter()
+            .filter_map(|d| match &d.resolution {
+                Resolution::PythonVenv { packages, .. } => Some(*packages),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(
+            declared.len(),
+            provisioned.len(),
+            "requirements.txt and the manifest's PythonVenv packages drifted"
+        );
+        for pkg in &declared {
+            assert!(
+                provisioned.iter().any(|p| p == pkg),
+                "`{pkg}` is in requirements.txt but not in the manifest's PythonVenv packages"
+            );
+        }
+    }
+
     /// The manifest must not resurrect the two models that cost 449 MB
     /// and are loaded by nothing.
     #[test]

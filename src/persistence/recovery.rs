@@ -54,14 +54,6 @@ impl RecoveryManager {
         }
     }
 
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-    }
-
-    pub fn set_interval(&mut self, secs: u64) {
-        self.interval_secs = secs;
-    }
-
     pub fn should_snapshot(&self, now: std::time::Instant) -> bool {
         if !self.enabled {
             return false;

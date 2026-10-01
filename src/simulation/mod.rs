@@ -11,7 +11,6 @@ use log::info;
 use crate::asset::AvatarAsset;
 use crate::avatar::AvatarInstance;
 use crate::math_utils::{quat_conjugate, quat_rotate_vec3, vec3_normalize, vec3_scale, Quat, Vec3};
-use crate::simulation::cloth::ClothLoDConfig;
 
 /// Scene-wide gravity shared by every secondary-motion solver (spring
 /// bones, cloth, Rapier). One source of truth replaces the three
@@ -164,7 +163,6 @@ pub struct PhysicsWorld {
     collider_count: usize,
     spring_chain_count: usize,
     scene_colliders: Vec<crate::asset::SceneColliderAsset>,
-    cloth_lod_presets: Vec<ClothLoDConfig>,
     #[cfg(feature = "rapier")]
     rapier: Option<RapierWorld>,
 }
@@ -175,7 +173,6 @@ impl PhysicsWorld {
             collider_count: 0,
             spring_chain_count: 0,
             scene_colliders: Vec::new(),
-            cloth_lod_presets: ClothLoDConfig::presets(),
             #[cfg(feature = "rapier")]
             rapier: None,
         }
@@ -227,26 +224,6 @@ impl PhysicsWorld {
 
     pub fn step_cloth(&mut self, dt: f32, avatar: &mut AvatarInstance, gravity: &SceneGravity) {
         let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
-        apply_cloth_gravity(avatar, gravity);
-        cloth_solver::step_cloth(dt, avatar, &world_colliders, None);
-    }
-
-    pub fn step_cloth_with_camera_distance(
-        &mut self,
-        dt: f32,
-        avatar: &mut AvatarInstance,
-        camera_distance: f32,
-        gravity: &SceneGravity,
-    ) {
-        let world_colliders = cloth::resolve_scene_colliders(&self.scene_colliders);
-        if let Some(ref mut sim) = avatar.cloth_sim {
-            let lod = ClothLoDConfig::select_for_distance(&self.cloth_lod_presets, camera_distance);
-            sim.apply_lod(&lod);
-        }
-        for slot in &mut avatar.cloth_overlays {
-            let lod = ClothLoDConfig::select_for_distance(&self.cloth_lod_presets, camera_distance);
-            slot.sim.apply_lod(&lod);
-        }
         apply_cloth_gravity(avatar, gravity);
         cloth_solver::step_cloth(dt, avatar, &world_colliders, None);
     }
@@ -322,10 +299,6 @@ impl PhysicsWorld {
 
     pub fn scene_collider_count(&self) -> usize {
         self.scene_colliders.len()
-    }
-
-    pub fn clear_scene_colliders(&mut self) {
-        self.scene_colliders.clear();
     }
 
     /// Initialise Rapier world (requires the `rapier` feature).
@@ -586,14 +559,6 @@ impl RapierWorld {
         }
     }
 
-    pub fn move_character(&mut self, velocity: [f32; 3]) {
-        if let Some(handle) = self.character_body {
-            if let Some(body) = self.rigid_body_set.get_mut(handle) {
-                body.set_linvel(vector![velocity[0], velocity[1], velocity[2]], true);
-            }
-        }
-    }
-
     pub fn character_position(&self) -> Option<[f32; 3]> {
         self.character_body.and_then(|handle| {
             self.rigid_body_set.get(handle).map(|body| {
@@ -601,40 +566,6 @@ impl RapierWorld {
                 [t.x, t.y, t.z]
             })
         })
-    }
-
-    pub fn query_sphere_cast(
-        &self,
-        origin: [f32; 3],
-        direction: [f32; 3],
-        max_distance: f32,
-        radius: f32,
-    ) -> Option<([f32; 3], [f32; 3])> {
-        let shape = rapier3d::geometry::Ball::new(radius);
-        let origin_iso = Isometry::translation(origin[0], origin[1], origin[2]);
-        let dir = vector![direction[0], direction[1], direction[2]];
-        let options = rapier3d::parry::query::ShapeCastOptions {
-            max_time_of_impact: max_distance,
-            stop_at_penetration: true,
-            ..Default::default()
-        };
-        let (_handle, hit) = self.query_pipeline.cast_shape(
-            &self.rigid_body_set,
-            &self.collider_set,
-            &origin_iso,
-            &dir,
-            &shape,
-            options,
-            QueryFilter::default(),
-        )?;
-        let toi = hit.time_of_impact;
-        let hit_point = [
-            origin[0] + direction[0] * toi,
-            origin[1] + direction[1] * toi,
-            origin[2] + direction[2] * toi,
-        ];
-        let normal = [-direction[0], -direction[1], -direction[2]];
-        Some((hit_point, normal))
     }
 }
 

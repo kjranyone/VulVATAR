@@ -701,7 +701,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 // shows not just WHERE the inference placed
                                 // a joint but HOW sure it was. Hands get
                                 // their own hue — they come from a separate
-                                // stage (the hand landmarker) than the body
+                                // stage (the hand chain) than the body
                                 // block (the pose detector).
                                 let mut drawn_kps = 0usize;
                                 for (i, &(kx, ky, conf)) in ann.keypoints.iter().enumerate() {
@@ -769,6 +769,49 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                     }
                                 }
 
+                                // Face stage: the sidecar's measured WFLW-98
+                                // landmarks — the points the avatar's head
+                                // pose, expressions and face-shape learning
+                                // are driven from. Dots per point; the rings
+                                // the expression math itself reads (eyes
+                                // 60..68 / 68..76, mouth 76..96) close as
+                                // outlines so the cluster reads as a face,
+                                // not 98 loose dots.
+                                let mut drawn_face = 0usize;
+                                for &(fx, fy, conf) in &ann.face_points {
+                                    if conf < 0.1 {
+                                        continue;
+                                    }
+                                    drawn_face += 1;
+                                    painter.circle_filled(
+                                        egui::pos2(map_x(fx), map_y(fy)),
+                                        1.5 + 1.0 * conf,
+                                        viz::face_keypoint_graded(conf),
+                                    );
+                                }
+                                const FACE_RINGS: [(usize, usize); 3] =
+                                    [(60, 68), (68, 76), (76, 96)];
+                                for &(ring_a, ring_b) in &FACE_RINGS {
+                                    for i in ring_a..ring_b {
+                                        let j = ring_a + (i - ring_a + 1) % (ring_b - ring_a);
+                                        let (Some(&(x1, y1, c1)), Some(&(x2, y2, c2))) = (
+                                            ann.face_points.get(i),
+                                            ann.face_points.get(j),
+                                        ) else {
+                                            continue;
+                                        };
+                                        if c1 >= 0.1 && c2 >= 0.1 {
+                                            painter.line_segment(
+                                                [
+                                                    egui::pos2(map_x(x1), map_y(y1)),
+                                                    egui::pos2(map_x(x2), map_y(y2)),
+                                                ],
+                                                egui::Stroke::new(1.0, viz::face_bone()),
+                                            );
+                                        }
+                                    }
+                                }
+
                                 // Hand-crop diagnostics: what the hand
                                 // stage looked at this frame, with the lock
                                 // presence — a rect that fades with a weak
@@ -806,8 +849,10 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                 }
 
                                 // Status badge under the PIP: how many
-                                // keypoints survived the gates, and the
-                                // hand stage's lock presence per side.
+                                // keypoints survived the gates, how many
+                                // face landmarks the sidecar published at
+                                // confidence, and the hand stage's lock
+                                // presence per side.
                                 let hand_label = |slot: Option<&crate::tracking::HandCropDiag>| {
                                     match slot {
                                         Some(c) => format!("{:.2}", c.presence),
@@ -815,7 +860,7 @@ pub fn draw(ctx: &egui::Context, state: &mut GuiApp) {
                                     }
                                 };
                                 let badge = format!(
-                                    "kp {drawn_kps}/{}  hand L {} R {}",
+                                    "kp {drawn_kps}/{}  face {drawn_face}  hand L {} R {}",
                                     ann.keypoints.len(),
                                     hand_label(ann.hand_crops[0].as_ref()),
                                     hand_label(ann.hand_crops[1].as_ref()),

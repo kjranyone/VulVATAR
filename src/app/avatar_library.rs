@@ -253,22 +253,6 @@ impl AvatarLibrary {
         cats.dedup();
         cats
     }
-
-    pub fn by_category(&self, category: &str) -> Vec<&AvatarLibraryEntry> {
-        self.entries
-            .iter()
-            .filter(|e| e.category.as_deref() == Some(category))
-            .collect()
-    }
-
-    pub fn export_catalog(&self) -> Result<String, String> {
-        serde_json::to_string_pretty(self)
-            .map_err(|e| format!("failed to serialize library catalog: {}", e))
-    }
-
-    pub fn import_catalog(json: &str) -> Result<Self, String> {
-        serde_json::from_str(json).map_err(|e| format!("failed to parse library catalog: {}", e))
-    }
 }
 
 impl Default for AvatarLibrary {

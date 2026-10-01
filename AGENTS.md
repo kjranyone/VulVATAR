@@ -446,7 +446,7 @@ channel で計測する。アプリがカメラを掴んでいる間は pyrealse
 - `debug_state.json` — 推論フレーム毎 (tracking worker)。`kp` (COCO 17 の 2D+score)、
   `kp_mcp` (両手ブロックの MCP 4点)、`torso`/`arm` の各関節 `{p, c, d}`
   (`d` = サンプラーが実際に返したカメラ空間深度 m — 「特徴点に正しい深度が付いたか」の一次証拠)、
-  `root` / `root_is_hip` / `metric` (anchor_cam_m, mpsu, ref_span_m)、`face`、`mesh_c`、`face_dbg`。
+  `root` / `root_is_hip` / `metric` (anchor_cam_m, mpsu, ref_span_m)、`face`、`mesh_c`。
 - `debug_avatar.json` — ソルバー後のアバター主要関節ワールド座標 (`seq` で新フレーム検出)。
   ユーザーが見ているものの数値化はこちら (rest 判定は Hips y ≈ 0.845 等)。
 - `debug_gui.json` — GUI フレーム毎。`paused` / `frame_count` / `sim_substeps` に加え
