@@ -1337,6 +1337,61 @@ impl FusionProvider {
             depth.as_ref().map(|d| d.points_m.as_slice());
         let mut hand_done = [false; 2];        self.last_hands = [None, None];
         if let Some(hl) = self.hands.as_mut() {
+            // Depth-blob proposals (desk envelope): computed once per frame
+            // from the full depth grid. Desk hands are the nearest surface
+            // in their window and form stable blobs (validated on a desk
+            // recording: centroids stable within ~5 px), while the
+            // keypoint seeds below score 0 at the frame's bottom edge.
+            // OFF by default: the first replay A/B was inconclusive — the
+            // recording's right hand is half out of frame, which no crop
+            // proposal fixes (cost when on: ~+1 inference/frame).
+            // `VULVATAR_HAND_DEPTH_BLOBS=1` enables.
+            let depth_blobs: Vec<(f32, f32, f32)> = if std::env::var_os("VULVATAR_HAND_DEPTH_BLOBS").is_some() {
+                depth
+                    .as_ref()
+                    .map(|d| super::hands::depth_hand_crops(&d.points_m, d.width, d.height))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let hand_ref_x = {
+                let mut rx = [0.0f32; 2];
+                for (hand, r) in rx.iter_mut().enumerate() {
+                    *r = self.prev_hands[hand]
+                        .as_ref()
+                        .map(|prev| {
+                            let (mut sx, mut n) = (0.0f32, 0usize);
+                            for p in &prev.px {
+                                sx += p[0];
+                                n += 1;
+                            }
+                            sx / n.max(1) as f32
+                        })
+                        .unwrap_or(f32::NAN);
+                }
+                rx
+            };
+            // Blob -> slot assignment. x-order is the ground truth when two
+            // blobs exist (left blob is the left hand); a single blob goes
+            // to the starved slot — the slot that already holds a lock has
+            // its prev re-crop at index 0 and must not steal the only
+            // proposal (measured 2026-10-01: an x-proximity default sent
+            // the never-locked right slot to the LEFT hand's blob, whose
+            // chirality then vetoed every attempt).
+            let blob_for_hand: [Option<usize>; 2] = match depth_blobs.len() {
+                0 => [None, None],
+                1 => {
+                    let starved = if hand_ref_x[0].is_nan() {
+                        0
+                    } else if hand_ref_x[1].is_nan() {
+                        1
+                    } else {
+                        0
+                    };
+                    [Some(0).filter(|_| starved == 0), Some(0).filter(|_| starved == 1)]
+                }
+                _ => [Some(0), Some(1)],
+            };
             // Palm-net proposals: ONE full-frame pass per frame (rtmpose
             // backend with the heatmap export; free for MediaPipe). This is
             // the acquisition source for hands the body detector never
@@ -1602,6 +1657,17 @@ impl FusionProvider {
                         0.5 * (y0 + y1) - size * 0.5,
                         size,
                     ));
+                }
+                // Depth-blob proposal: the nearest-surface component at
+                // hand scale, pre-assigned to this slot before the loop
+                // (x-order for two blobs, starved slot first for one — see
+                // the assignment comment). Runs before the keypoint-seeded
+                // crops because those score 0 at the frame's bottom edge —
+                // where desk hands live.
+                if let Some(bi) = blob_for_hand[hand] {
+                    if let Some(c) = depth_blobs.get(bi).copied() {
+                        candidates.push(c);
+                    }
                 }
                 if let Some(c) =
                     super::hands::detector_hand_crop(&det_kps, hand, width, height, 0.35, 96.0)
@@ -3264,7 +3330,7 @@ impl FusionProvider {
         }
         ph.facefit_ms = t_facefit.elapsed().as_secs_f32() * 1000.0;
 
-        // Hand blocks of the annotation: the hand landmarker owns hand
+        // Hand blocks of the annotation: the hand chain owns hand
         // keypoints now that no wholebody detector fills them. The GUI
         // wipe plots every entry with score ≥ 0.1, so without this the
         // hands vanished from the preview overlay after the YOLO26 swap.
@@ -3457,7 +3523,7 @@ fn dump_obs_post_solve(
     }
 }
 
-/// Publish the hand-landmarker results into the annotation's
+/// Publish the hand-chain results into the annotation's
 /// COCO-Wholebody hand blocks (left 91..112, right 112..133) in
 /// MediaPipe landmark order (0 = wrist) — the layout the wholebody
 /// detector used to fill and the GUI wipe plots (score ≥ 0.1). Score

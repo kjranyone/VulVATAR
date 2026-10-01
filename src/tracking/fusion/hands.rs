@@ -1236,3 +1236,169 @@ mod batch_bench {
         );
     }
 }
+
+/// Depth-blob hand proposals for the desk envelope (2026-10-01): hands
+/// resting on a desk are the nearest surface in their own window and form
+/// stable connected components in the near-depth mask (measured on a desk
+/// recording: two blobs, centroids stable within ~5 px frame-to-frame).
+/// This exists because the body-keypoint seeds the candidate chain
+/// otherwise leans on score 0 at the frame's bottom edge — exactly where
+/// desk hands live (measured: right hand 1 candidate in 600 replay frames
+/// vs left 82 — the hand-detection blink).
+///
+/// Near = at least 0.10 m closer than the median depth of the frame's
+/// central band (the torso). Labelling runs on a 4x downsampled grid with
+/// a plain flood fill (~19k cells, sub-ms). Returns at most two crop
+/// windows `(x0, y0, size)`, leftmost first; the caller assigns them to
+/// slots by x proximity.
+pub(crate) fn depth_hand_crops(
+    points_m: &[[f32; 3]],
+    width: u32,
+    height: u32,
+) -> Vec<(f32, f32, f32)> {
+    const DS: usize = 4;
+    const NEAR_MARGIN_M: f32 = 0.10;
+    // ~200 px full-res (a fist at the blob edge) .. ~13k px (hand +
+    // forearm). The desk plane is far larger and its surface sits within
+    // the torso band, so both bounds exclude it.
+    const MIN_CELLS: usize = 12;
+    const MAX_CELLS: usize = 800;
+    let (w, h) = (width as usize, height as usize);
+    if points_m.len() < w * h || w < DS || h < DS {
+        return Vec::new();
+    }
+    // Torso reference depth: median of the frame's central band.
+    let mut band: Vec<f32> = Vec::new();
+    for y in (h / 3)..(h * 2 / 3).min(h) {
+        for x in (w / 5)..(w * 4 / 5).min(w) {
+            let z = points_m[y * w + x][2];
+            if z.is_finite() && z > 0.05 {
+                band.push(z);
+            }
+        }
+    }
+    if band.len() < 64 {
+        return Vec::new();
+    }
+    band.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let z_near = band[band.len() / 2] - NEAR_MARGIN_M;
+    // Downsampled near mask: a cell is set when ANY of its samples is
+    // near (dilates by up to 3 px — harmless for blob finding).
+    let (gw, gh) = (w / DS, h / DS);
+    let mut mask = vec![false; gw * gh];
+    for gy in 0..gh {
+        for gx in 0..gw {
+            'cell: for dy in 0..DS {
+                for dx in 0..DS {
+                    let z = points_m[(gy * DS + dy) * w + gx * DS + dx][2];
+                    if z.is_finite() && z > 0.05 && z < z_near {
+                        mask[gy * gw + gx] = true;
+                        break 'cell;
+                    }
+                }
+            }
+        }
+    }
+    let mut seen = vec![false; gw * gh];
+    let mut blobs: Vec<((f32, f32, f32), f32)> = Vec::new();
+    for start in 0..mask.len() {
+        if !mask[start] || seen[start] {
+            continue;
+        }
+        let mut stack = vec![start];
+        seen[start] = true;
+        let mut cells: Vec<usize> = Vec::new();
+        while let Some(i) = stack.pop() {
+            cells.push(i);
+            let x = i % gw;
+            let y = i / gw;
+            let neighbours = [
+                x.checked_add(1).map(|nx| (nx, y)),
+                x.checked_sub(1).map(|nx| (nx, y)),
+                Some((x, y + 1)),
+                y.checked_sub(1).map(|ny| (x, ny)),
+            ];
+            for n in neighbours.into_iter().flatten() {
+                let (nx, ny) = n;
+                if nx < gw && ny < gh {
+                    let j = ny * gw + nx;
+                    if mask[j] && !seen[j] {
+                        seen[j] = true;
+                        stack.push(j);
+                    }
+                }
+            }
+        }
+        if cells.len() < MIN_CELLS || cells.len() > MAX_CELLS {
+            continue;
+        }
+        let (mut sx, mut sy) = (0.0f32, 0.0f32);
+        for &i in &cells {
+            sx += (i % gw) as f32;
+            sy += (i / gw) as f32;
+        }
+        let n = cells.len() as f32;
+        let cx = (sx / n + 0.5) * DS as f32;
+        let cy = (sy / n + 0.5) * DS as f32;
+        let size = ((n.sqrt() * DS as f32) * 1.6).clamp(96.0, 320.0);
+        let crop = (
+            (cx - 0.5 * size).clamp(0.0, (w as f32 - size).max(0.0)),
+            (cy - 0.5 * size).clamp(0.0, (h as f32 - size).max(0.0)),
+            size,
+        );
+        blobs.push((crop, cx));
+    }
+    blobs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    blobs.into_iter().take(2).map(|(crop, _)| crop).collect()
+}
+
+#[cfg(test)]
+mod depth_blob_tests {
+    use super::*;
+
+    /// 640x480 grid: torso band at 0.70 m across the middle, wall far
+    /// behind, two hand-sized near blobs at z 0.45 m (left of centre and
+    /// right of centre, lower third). Both must be proposed, leftmost
+    /// first, at hand scale.
+    fn synth_frame() -> Vec<[f32; 3]> {
+        let (w, h) = (640usize, 480usize);
+        let mut pts = vec![[f32::NAN; 3]; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let z = if (h / 3..h * 2 / 3).contains(&y) {
+                    0.70
+                } else {
+                    3.0
+                };
+                pts[y * w + x][2] = z;
+            }
+        }
+        for &(bx, by) in &[(160usize, 400usize), (480, 400)] {
+            for y in by - 12..by + 12 {
+                for x in bx - 18..bx + 18 {
+                    pts[y * w + x][2] = 0.45;
+                }
+            }
+        }
+        pts
+    }
+
+    #[test]
+    fn desk_hands_become_two_left_to_right_proposals() {
+        let crops = depth_hand_crops(&synth_frame(), 640, 480);
+        assert_eq!(crops.len(), 2, "both desk hands found: {crops:?}");
+        assert!(crops[0].0 < crops[1].0, "leftmost first: {crops:?}");
+        for c in &crops {
+            assert!((96.0..=320.0).contains(&c.2), "hand-scale crop: {c:?}");
+        }
+    }
+
+    #[test]
+    fn all_near_field_yields_nothing() {
+        // A wall-filling near depth (the sensor pointing at the desk only)
+        // is one giant component past MAX_CELLS — no proposals, no locks.
+        let (w, h) = (640usize, 480usize);
+        let pts = vec![[0.0f32, 0.0, 0.45]; w * h];
+        assert!(depth_hand_crops(&pts, 640, 480).is_empty());
+    }
+}
