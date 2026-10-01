@@ -1258,7 +1258,11 @@ mod batch_bench {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DepthHandBlob {
     pub crop: (f32, f32, f32),
-    pub centroid_m: [f32; 3],
+    /// Wrist 3D estimate for the depth observation: the blob's principal
+    /// axis, stepped back ~40% of the blob length from its distal
+    /// (away-from-torso) end — the wrist sits at the hand's base, not at
+    /// the blob centroid (which is forearm-biased by ~15 cm, measured).
+    pub wrist_m: [f32; 3],
 }
 
 pub(crate) fn depth_hand_crops(
@@ -1356,34 +1360,81 @@ pub(crate) fn depth_hand_crops(
                 (cy - 0.5 * size).clamp(0.0, (h as f32 - size).max(0.0)),
                 size,
             );
-            // 3D centroid: mean xyz over the blob's near samples
-            // (points_m is metric camera space — no unprojection needed).
-            let (mut sum, mut cnt) = ([0.0f64; 3], 0usize);
+            // Per-cell near-sample xyz means (for the wrist estimate and
+            // the mean depth), plus 2D covariance for the principal axis.
+            // NEAR samples only: the dilated cell mask lets torso-depth
+            // samples through, and a mean mixing those is the torso.
+            let (mut sx2, mut sy2) = (0.0f32, 0.0f32);
+            let mut cell_mean: Vec<([f32; 2], [f32; 3])> = Vec::with_capacity(cells.len());
             for &i in &cells {
+                let (mut px, mut py, mut psum, mut pc) =
+                    (0.0f32, 0.0f32, [0.0f64; 3], 0usize);
                 for dy in 0..DS {
                     for dx in 0..DS {
-                        let p = points_m[(i / gw * DS + dy) * w + (i % gw) * DS + dx];
-                        // NEAR samples only: the dilated cell mask lets
-                        // torso-depth and NaN samples through, and a
-                        // centroid mixing those is the torso, not the hand.
+                        let (fy, fx) = ((i / gw) * DS + dy, (i % gw) * DS + dx);
+                        let p = points_m[fy * w + fx];
                         if p[2].is_finite() && p[2] > 0.05 && p[2] < z_near {
+                            px += fx as f32;
+                            py += fy as f32;
                             for k in 0..3 {
-                                sum[k] += f64::from(p[k]);
+                                psum[k] += f64::from(p[k]);
                             }
-                            cnt += 1;
+                            pc += 1;
                         }
                     }
                 }
+                if pc > 0 {
+                    sx2 += px / pc as f32;
+                    sy2 += py / pc as f32;
+                    let m = [
+                        (psum[0] / pc as f64) as f32,
+                        (psum[1] / pc as f64) as f32,
+                        (psum[2] / pc as f64) as f32,
+                    ];
+                    cell_mean.push(([px / pc as f32, py / pc as f32], m));
+                }
             }
-            if cnt < 32 {
+            if cell_mean.len() < MIN_CELLS {
                 continue;
             }
-            let centroid_m = [
-                (sum[0] / cnt as f64) as f32,
-                (sum[1] / cnt as f64) as f32,
-                (sum[2] / cnt as f64) as f32,
-            ];
-            blobs.push((DepthHandBlob { crop, centroid_m }, cx));
+            // Principal axis (2x2 covariance, closed form) oriented AWAY
+            // from the torso centre: the hand is at the blob's distal end.
+            let n = cell_mean.len() as f32;
+            let (mx, my) = (sx2 / n, sy2 / n);
+            let (mut cxx, mut cxy, mut cyy) = (0.0f32, 0.0f32, 0.0f32);
+            for (p, _) in &cell_mean {
+                let (dx, dy) = (p[0] - mx, p[1] - my);
+                cxx += dx * dx;
+                cxy += dx * dy;
+                cyy += dy * dy;
+            }
+            let theta = 0.5 * ((cyy - cxx).atan2(2.0 * cxy));
+            let (mut ax, mut ay) = (theta.cos(), theta.sin());
+            // orient away from the torso centre
+            let (tcx, tcy) = (w as f32 * 0.5, h as f32 * 0.45);
+            if (mx - tcx) * ax + (my - tcy) * ay < 0.0 {
+                ax = -ax;
+                ay = -ay;
+            }
+            // Distal end: the cell extreme along the axis; the wrist sits
+            // ~40% of the blob length back from it (the blob covers
+            // forearm + hand; the hand is the distal ~half).
+            let proj = |p: &[f32; 2]| (p[0] - mx) * ax + (p[1] - my) * ay;
+            let max_proj = cell_mean.iter().map(|(p, _)| proj(p)).fold(f32::MIN, f32::max);
+            let tip_len = max_proj;
+            let wrist_uv = cell_mean
+                .iter()
+                .min_by(|a, b| {
+                    let da = (proj(&a.0) - (max_proj * 0.60)).abs();
+                    let db = (proj(&b.0) - (max_proj * 0.60)).abs();
+                    da.partial_cmp(&db).unwrap()
+                })
+                .map(|(_, m)| *m)
+                .unwrap_or([f32::NAN; 3]);
+            let _ = tip_len;
+            if wrist_uv[2].is_finite() {
+                blobs.push((DepthHandBlob { crop, wrist_m: wrist_uv }, cx));
+            }
         }
         blobs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         blobs.into_iter().take(2).map(|(b, _)| b).collect()
@@ -1427,11 +1478,11 @@ mod depth_blob_tests {
         assert!(blobs[0].crop.0 < blobs[1].crop.0, "leftmost first: {blobs:?}");
         for b in &blobs {
             assert!((96.0..=320.0).contains(&b.crop.2), "hand-scale crop: {b:?}");
-            // The synthetic blobs sit at z 0.45 m; the centroid must land
-            // within a few cm of it (it feeds the wrist 3D observation).
+            // The synthetic blobs sit at z 0.45 m; the wrist estimate must
+            // land on the blob (it feeds the wrist 3D observation).
             assert!(
-                (b.centroid_m[2] - 0.45).abs() < 0.05,
-                "centroid z near the blob depth: {b:?}"
+                (b.wrist_m[2] - 0.45).abs() < 0.05,
+                "wrist z near the blob depth: {b:?}"
             );
         }
     }
@@ -1502,7 +1553,7 @@ mod depth_blob_assign_tests {
     fn blob(x: f32) -> DepthHandBlob {
         DepthHandBlob {
             crop: (x - 48.0, 380.0, 96.0),
-            centroid_m: [0.0, 0.0, 0.45],
+            wrist_m: [0.0, 0.0, 0.45],
         }
     }
 

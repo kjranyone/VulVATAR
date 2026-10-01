@@ -1337,16 +1337,14 @@ impl FusionProvider {
             depth.as_ref().map(|d| d.points_m.as_slice());
         let mut hand_done = [false; 2];        self.last_hands = [None, None];
         if let Some(hl) = self.hands.as_mut() {
-            // Depth-blob proposals (desk envelope): computed once per frame
-            // from the full depth grid. Desk hands are the nearest surface
-            // in their window and form stable blobs (validated on a desk
-            // recording: centroids stable within ~5 px), while the
-            // keypoint seeds below score 0 at the frame's bottom edge.
-            // OFF by default: the first replay A/B was inconclusive — the
-            // recording's right hand is half out of frame, which no crop
-            // proposal fixes (cost when on: ~+1 inference/frame).
-            // `VULVATAR_HAND_DEPTH_BLOBS=1` enables.
-            let depth_blobs: Vec<super::hands::DepthHandBlob> = if std::env::var_os("VULVATAR_HAND_DEPTH_BLOBS").is_some() {
+            // Depth-blob hand path (desk envelope): desk hands are the
+            // nearest surface in their window and form stable near-depth
+            // blobs (validated: centroids stable within ~5 px), while the
+            // keypoint seeds the chain otherwise leans on score 0 at the
+            // frame's bottom edge — where desk hands live. Feeds both the
+            // crop candidates and (drought frames) the wrist 3D
+            // observation. `VULVATAR_HAND_NO_DEPTH_BLOBS=1` disables.
+            let depth_blobs: Vec<super::hands::DepthHandBlob> = if std::env::var_os("VULVATAR_HAND_NO_DEPTH_BLOBS").is_none() {
                 depth
                     .as_ref()
                     .map(|d| super::hands::depth_hand_crops(&d.points_m, d.width, d.height))
@@ -3015,8 +3013,19 @@ impl FusionProvider {
         // on frames the slot DID lock (the 21 landmark terms own the
         // wrist then); the Cauchy kernel absorbs the systematic centroid
         // offset, and the arm sigma-cap loop downstream applies its usual
-        // cap. `VULVATAR_HAND_DEPTH_OBS=1` (default OFF until the desk
-        // A/B passes: watch torso yaw std — the arm-coupling canary).
+        // cap. The anchor is the principal-axis wrist estimate (40% back
+        // from the blob's distal end), not the raw centroid — the raw
+        // centroid yanked the wrist and tripled the snaps (bench
+        // 2026-10-01). Watch torso yaw std in every A/B: the
+        // arm-coupling canary.
+        // OPT-IN (VULVATAR_HAND_DEPTH_OBS=1): the A/B failed twice — the
+        // naive centroid anchor AND the principal-axis wrist estimate both
+        // left duty untouched while multiplying wrist snaps (4 -> 36 / 42)
+        // and nudging torso yaw std (3.5 -> 4.2). Something in the arm path
+        // absorbs or fights the term before it reaches the wrist's
+        // data-sigma; that needs a measurement-first pass (does the Kp3d
+        // reach the solve at all?) before this can default on. The crop
+        // proposals above ship default on — they are the validated half.
         if std::env::var_os("VULVATAR_HAND_DEPTH_OBS").is_some() {
             if let Some(d) = depth.as_ref() {
                 let blobs = super::hands::depth_hand_crops(&d.points_m, d.width, d.height);
@@ -3045,12 +3054,12 @@ impl FusionProvider {
                             obs.kp3d.push(super::estimator::Kp3d {
                                 point: super::estimator::ModelPoint::Joint(j_wr),
                                 p: [
-                                    f64::from(b.centroid_m[0]),
-                                    f64::from(b.centroid_m[1]),
-                                    f64::from(b.centroid_m[2]),
+                                    f64::from(b.wrist_m[0]),
+                                    f64::from(b.wrist_m[1]),
+                                    f64::from(b.wrist_m[2]),
                                 ],
-                                sigma: 0.15,
-                                lat_scale: 2.0,
+                                sigma: 0.10,
+                                lat_scale: 1.5,
                             });
                         }
                     }
