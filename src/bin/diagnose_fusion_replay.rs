@@ -955,16 +955,8 @@ fn main() -> Result<(), String> {
             ]);
         }
         for hand in 0..2 {
-            if let Some(hr) = provider.last_hands[hand].as_ref() {
+            if provider.last_hands[hand].is_some() {
                 hand_frames[hand] += 1;
-                if std::env::var_os("VULVATAR_REPLAY_HANDDUMP").is_some() && n % 8 == 0 {
-                    let w = &hr.world;
-                    let tip = w[8];
-                    let mcp = w[5];
-                    eprintln!("idx {idx} hand {hand}: presence {:.2} handed {:.2} crop {:?} wrist px ({:.0},{:.0}) index_mcp world ({:+.3},{:+.3},{:+.3}) index_tip ({:+.3},{:+.3},{:+.3}) |mcp| {:.3}",
-                        hr.presence, hr.handedness, hr.crop, hr.px[0][0], hr.px[0][1], mcp[0], mcp[1], mcp[2], tip[0], tip[1], tip[2],
-                        (mcp[0]*mcp[0]+mcp[1]*mcp[1]+mcp[2]*mcp[2]).sqrt());
-                }
             }
         }
         if let Some(p) = lw_prev {
