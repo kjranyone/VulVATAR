@@ -267,11 +267,10 @@ impl FaceRtmpose {
             );
             None
         };
-        let python = std::env::var("VULVATAR_FACE_SIDECAR_PYTHON")
-            .unwrap_or_else(|_| "python".to_string());
         let script = std::env::var("VULVATAR_FACE_SIDECAR_SCRIPT")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("scripts/face98_service.py"));
+        let python = Self::resolve_sidecar_python(&script);
         Ok(Self {
             child: None,
             python,
@@ -285,6 +284,24 @@ impl FaceRtmpose {
         })
     }
 
+    /// Python interpreter for the sidecar: VULVATAR_FACE_SIDECAR_PYTHON
+    /// wins, then the repo-local venv bootstrapped by dev.ps1 from
+    /// requirements.txt (`<scripts>/../.venv`), then PATH's "python".
+    fn resolve_sidecar_python(script: &Path) -> String {
+        if let Ok(p) = std::env::var("VULVATAR_FACE_SIDECAR_PYTHON") {
+            return p;
+        }
+        if let Some(root) = script.parent().and_then(Path::parent) {
+            for rel in [".venv/Scripts/python.exe", ".venv/bin/python"] {
+                let candidate = root.join(rel);
+                if candidate.is_file() {
+                    return candidate.to_string_lossy().into_owned();
+                }
+            }
+        }
+        "python".to_string()
+    }
+
     fn spawn(&mut self) -> Result<(), String> {
         if !self.script.is_file() {
             return Err(format!(
@@ -296,12 +313,40 @@ impl FaceRtmpose {
             .arg(&self.script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // keep stderr: a crashed sidecar's traceback is the only
+            // evidence of why (drained and logged on reap)
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("spawn face sidecar: {e}"))?;
         info!("face sidecar started ({} {})", self.python, self.script.display());
         self.child = Some(child);
         Ok(())
+    }
+
+    /// Kill the sidecar, reap it and drain its stderr (the process is
+    /// dead by then, so EOF is immediate). Empty when it said nothing.
+    fn reap(&mut self) -> String {
+        let child = match self.child.as_mut() {
+            Some(c) => c,
+            None => return String::new(),
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut buf = Vec::new();
+        if let Some(err) = child.stderr.as_mut() {
+            let _ = err.read_to_end(&mut buf);
+        }
+        if buf.is_empty() {
+            return String::new();
+        }
+        let text = String::from_utf8_lossy(&buf);
+        // keep the tail: python tracebacks put the actual error last
+        let start = text.len().saturating_sub(1500);
+        let mut tail = text[start..].to_string();
+        if start > 0 {
+            tail.insert(0, '…');
+        }
+        tail
     }
 
     fn roundtrip(&mut self, crop: &[u8]) -> Option<Vec<[f32; 2]>> {
@@ -357,18 +402,24 @@ impl FaceRtmpose {
                 }
             }
         }
-        // dead sidecar: reap and retry once with a fresh process
+        // dead sidecar: reap (draining its stderr) and retry once with a
+        // fresh process
         self.fail_run += 1;
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        let stderr_tail = self.reap();
         self.child = None;
+        if !stderr_tail.is_empty() && self.fail_run == 1 {
+            error!("face sidecar stderr: {stderr_tail}");
+        }
         if self.fail_run >= MAX_FAIL_ROUNDS {
             error!(
                 "face sidecar failed {} rounds in a row — expressions disabled \
-                 for this session (tracking restart re-arms)",
-                self.fail_run
+                 for this session (tracking restart re-arms){}",
+                self.fail_run,
+                if stderr_tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nstderr:\n{stderr_tail}")
+                }
             );
             return None;
         }
@@ -960,5 +1011,36 @@ impl Drop for FaceWorker {
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod sidecar_python_tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_python_prefers_repo_venv() {
+        // VULVATAR_FACE_SIDECAR_PYTHON would win over the venv; the test
+        // needs it unset (no other test in this crate touches it).
+        std::env::remove_var("VULVATAR_FACE_SIDECAR_PYTHON");
+        let root = std::env::temp_dir().join("vulvatar_face_sidecar_pytest");
+        let scripts = root.join("scripts");
+        std::fs::create_dir_all(root.join(".venv/Scripts")).unwrap();
+        std::fs::write(root.join(".venv/Scripts/python.exe"), b"").unwrap();
+        let resolved = FaceRtmpose::resolve_sidecar_python(&scripts.join("face98_service.py"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            resolved,
+            root.join(".venv/Scripts/python.exe")
+                .to_string_lossy()
+                .into_owned()
+        );
+    }
+
+    #[test]
+    fn sidecar_python_falls_back_to_path() {
+        std::env::remove_var("VULVATAR_FACE_SIDECAR_PYTHON");
+        let script = Path::new("no_such_root/scripts/face98_service.py");
+        assert_eq!(FaceRtmpose::resolve_sidecar_python(script), "python");
     }
 }
