@@ -1,0 +1,10 @@
+# Runtime Python dependencies for app-spawned sidecar scripts — the
+# single place they are declared. The dev menu's "python deps" entry
+# (dev.ps1 Install-PythonDeps, also run automatically by the run
+# entries) bootstraps .venv from this file, and the app prefers that
+# .venv for the face sidecar (VULVATAR_FACE_SIDECAR_PYTHON overrides).
+#
+# Training/export tooling (ultralytics, onnx, onnxslim, ...) is
+# deliberately NOT here — isolated venvs, see AGENTS.md "Tracking".
+numpy
+ai-edge-litert

@@ -437,6 +437,7 @@ fn main() -> Result<(), String> {
         .unwrap_or(0);
     let initial_hips_transform = avatar.pose.local_transforms[hips_node_idx].clone();
 
+    let mut render_times: Vec<std::time::Duration> = Vec::new();
     for frame in 0..=total_frames {
         let t = frame as f32 * dt;
 
@@ -588,12 +589,14 @@ fn main() -> Result<(), String> {
             );
 
             // Double render invocation for pipelined CPU readback
+            let render_t0 = std::time::Instant::now();
             let _ = renderer
                 .render(&frame_input)
                 .map_err(|e| format!("Rendering warm-up failed at frame {}: {}", frame, e))?;
             let render_result = renderer
                 .render(&frame_input)
                 .map_err(|e| format!("Rendering failed at frame {}: {}", frame, e))?;
+            render_times.push(render_t0.elapsed());
 
             // Fold the GPU readback into the overlay's ClothState so the
             // per-frame health check reads the LIVE solver state (GPU
@@ -733,6 +736,25 @@ fn main() -> Result<(), String> {
     }
     std::fs::write(&report_path, report).map_err(|e| format!("Failed to write report: {}", e))?;
     println!("\nWrote verification summary to {}", report_path.display());
+
+    // CLOTH_RENDER_TIMING=1: per-render() wall time (fence wait included —
+    // the same semantics as the app's render_cpu_ms). Zero GPU
+    // instrumentation: the RENDER_PROF query pools TDR Intel drivers here.
+    if std::env::var_os("CLOTH_RENDER_TIMING").is_some() {
+        let mut ms = render_times.iter().map(|d| d.as_secs_f64() * 1e3).collect::<Vec<_>>();
+        if !ms.is_empty() {
+            ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p = |q: f64| ms[((ms.len() as f64 - 1.0) * q) as usize];
+            println!(
+                "RENDER_TIMING n={} med={:.2}ms p95={:.2}ms min={:.2} max={:.2}",
+                ms.len(),
+                p(0.5),
+                p(0.95),
+                ms[0],
+                ms[ms.len() - 1]
+            );
+        }
+    }
 
     println!("\n=== Cloth simulation diagnostic completed successfully! ===");
     Ok(())

@@ -67,7 +67,7 @@ fn main() -> Result<(), String> {
 
     // CPU-side skinning sanity for the skirt mesh: at the bind pose every
     // skinning matrix must be ~identity, so skinned world positions must
-    // stay inside the raw bounds. Report the bbox and any flyers.
+    // stay inside the raw bounds. Report the bbox and the max excursion.
     if let Some(skirt) = asset
         .meshes
         .iter()

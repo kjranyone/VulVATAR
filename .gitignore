@@ -93,3 +93,6 @@ models/*bak
 # from silently dropping them again.
 !models/mp_canonical478.npy
 !models/mp_wflw98_idx.json
+
+# repo-local python venv (dev.ps1 Install-PythonDeps)
+.venv/

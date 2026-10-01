@@ -1,6 +1,6 @@
 //! ONNX Runtime session construction with the project-wide
-//! "DirectML, fall back to CPU" policy. Used by the RTMW3D session in
-//! `mod.rs` and re-used as `pub(in crate::tracking)` by the sibling
+//! "DirectML, fall back to CPU" policy. Used by the YOLO26-pose session
+//! in `mod.rs` and re-used as `pub(in crate::tracking)` by the sibling
 //! face-mesh / blendshape modules so they share the same EP
 //! selection logic.
 

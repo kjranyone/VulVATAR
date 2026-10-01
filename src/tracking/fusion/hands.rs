@@ -579,7 +579,7 @@ fn peak_and_sharpness(bins: &[f32]) -> (usize, f32) {
 }
 
 /// 3-point parabolic sub-bin offset around `peak`, clamped to ±0.5 —
-/// the same refinement `decode_simcc` applies to RTMW3D's SimCC.
+/// the same refinement the retired RTMW3D SimCC decode applied.
 fn refine_peak(bins: &[f32], peak: usize) -> f32 {
     if peak == 0 || peak + 1 >= bins.len() {
         return peak as f32;
