@@ -1250,11 +1250,10 @@ mod batch_bench {
 /// central band (the torso). Labelling runs on a 4x downsampled grid with
 /// a plain flood fill (~19k cells, sub-ms). Returns at most two crop
 /// windows `(x0, y0, size)`, leftmost first; the caller assigns them to
-/// slots by x proximity.
+/// slots (x-order for two blobs, starved slot first for one).
 /// A depth-blob hand proposal: the crop window the landmark ladder
-/// samples, plus the blob's 3D centroid in camera space (mean xyz of the
-/// blob's near pixels — `points_m` is already metric) for the wrist 3D
-/// observation (`VULVATAR_HAND_DEPTH_OBS`).
+/// samples, plus a wrist 3D estimate in camera space for the wrist 3D
+/// observation (`VULVATAR_HAND_DEPTH_OBS`) — see the field doc.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DepthHandBlob {
     pub crop: (f32, f32, f32),
@@ -1408,7 +1407,7 @@ pub(crate) fn depth_hand_crops(
                 cxy += dx * dy;
                 cyy += dy * dy;
             }
-            let theta = 0.5 * ((cyy - cxx).atan2(2.0 * cxy));
+            let theta = 0.5 * ((2.0 * cxy).atan2(cxx - cyy));
             let (mut ax, mut ay) = (theta.cos(), theta.sin());
             // orient away from the torso centre
             let (tcx, tcy) = (w as f32 * 0.5, h as f32 * 0.45);
@@ -1421,7 +1420,6 @@ pub(crate) fn depth_hand_crops(
             // forearm + hand; the hand is the distal ~half).
             let proj = |p: &[f32; 2]| (p[0] - mx) * ax + (p[1] - my) * ay;
             let max_proj = cell_mean.iter().map(|(p, _)| proj(p)).fold(f32::MIN, f32::max);
-            let tip_len = max_proj;
             let wrist_uv = cell_mean
                 .iter()
                 .min_by(|a, b| {
@@ -1431,7 +1429,6 @@ pub(crate) fn depth_hand_crops(
                 })
                 .map(|(_, m)| *m)
                 .unwrap_or([f32::NAN; 3]);
-            let _ = tip_len;
             if wrist_uv[2].is_finite() {
                 blobs.push((DepthHandBlob { crop, wrist_m: wrist_uv }, cx));
             }
@@ -1494,6 +1491,45 @@ mod depth_blob_tests {
         let (w, h) = (640usize, 480usize);
         let pts = vec![[0.0f32, 0.0, 0.45]; w * h];
         assert!(depth_hand_crops(&pts, 640, 480).is_empty());
+    }
+
+    #[test]
+    fn elongated_blob_wrist_lands_at_distal_end() {
+        // The wrist estimate rides the blob's principal axis. A vertical
+        // bar hanging below the torso centre has a vertical principal axis
+        // and its distal (away-from-torso) end at the BOTTOM, so the
+        // estimate must land near the bar's x centre and in its lower
+        // part. Guards the closed-form axis angle: swapping the atan2
+        // arguments rotates the axis a constant 45°, flips the
+        // away-from-torso orientation for below-torso blobs, and lands the
+        // estimate at the proximal (elbow) end instead (measured y 285.5
+        // vs the correct 409.5, 2026-10-02).
+        let (w, h) = (640usize, 480usize);
+        let mut pts = vec![[f32::NAN; 3]; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let z = if (h / 3..h * 2 / 3).contains(&y) {
+                    0.70
+                } else {
+                    3.0
+                };
+                pts[y * w + x] = [x as f32, y as f32, z];
+            }
+        }
+        // 16 x 200 px = 4 x 50 grid cells, inside [MIN_CELLS, MAX_CELLS].
+        for y in 250..450 {
+            for x in 158..174 {
+                pts[y * w + x] = [x as f32, y as f32, 0.45];
+            }
+        }
+        let blobs = depth_hand_crops(&pts, 640, 480);
+        assert_eq!(blobs.len(), 1, "{blobs:?}");
+        let b = &blobs[0];
+        assert!(
+            (156.0..=176.0).contains(&b.wrist_m[0]),
+            "wrist x near the bar's centre: {b:?}"
+        );
+        assert!(b.wrist_m[1] > 390.0, "wrist y in the distal half: {b:?}");
     }
 }
 
