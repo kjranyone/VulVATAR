@@ -116,6 +116,22 @@ pub struct Estimator {
     /// Wrist joint indices (`l_wrist`, `r_wrist`; `(0, false)` if the
     /// model has none — holds disabled).
     wrist_joints: [(usize, bool); 2],
+    /// Pelvis joint indices (`pelvis`, `l_hip`, `r_hip`) — the direct
+    /// observation set for the root hold below.
+    pelvis_joints: [usize; 3],
+    /// Seconds since a pelvis observation last entered the cost. Past the
+    /// engage threshold this freezes root pitch/roll (the root hold): with
+    /// the pelvis unobserved, nothing directly measures root rotation and
+    /// the upper-body residuals must not be free to drag it.
+    pelvis_unobserved_s: f32,
+    /// Seconds of CONTINUOUS pelvis observation. Release hysteresis for the
+    /// root hold: a single noisy hip detection must not flip the freeze off
+    /// and back on (release transients were the measured regression of the
+    /// first bench round on the dynamic frontal sessions).
+    pelvis_observed_streak_s: f32,
+    /// Whether the root hold was engaged on the previous frame (the
+    /// hysteresis branch selector).
+    root_hold_locked: bool,
     /// Per-wrist hold target for THIS frame: `(active, wrist − root_t)`
     /// in the camera frame, taken from the prediction. `active` is false
     /// on bootstrap frames and on any frame where the wrist carries an
@@ -205,6 +221,20 @@ pub struct SolveTimings {
     /// `finish()`: covariance inverse + σ propagation + bookkeeping.
     pub finish_ms: f64,
 }
+
+/// Root hold engages after this much continuous pelvis-unobserved time.
+/// The desk envelope's drought is session-long, so 0.3 s arms it within
+/// half a second of tracking start; brief frontal occlusions stay under
+/// it, and the ones that do cross it are released by the hysteresis
+/// below. (Benched: 0.5 s engage let the root wander unimpeded for the
+/// first half second of every desk re-acquisition and froze the wrong
+/// basin on s1789543658 — root z std 65 → 76 mm.)
+const ROOT_HOLD_ENGAGE_S: f32 = 0.3;
+/// Root hold releases only after this much CONTINUOUS pelvis observation.
+/// Instant release on a single noisy hip detection made the freeze flap
+/// (release transients: tilt std +1.5° on the dynamic frontal sessions,
+/// first bench round 2026-10-02).
+const ROOT_HOLD_RELEASE_S: f32 = 0.3;
 
 impl Estimator {
     pub fn new(model: &Model, params: Params) -> Self {
@@ -297,6 +327,18 @@ impl Estimator {
                     model.joints.iter().any(|j| j.name == "r_wrist"),
                 ),
             ],
+            pelvis_joints: [
+                model
+                    .joints
+                    .iter()
+                    .position(|j| j.name == "pelvis")
+                    .unwrap_or(0),
+                model.joints.iter().position(|j| j.name == "l_hip").unwrap_or(0),
+                model.joints.iter().position(|j| j.name == "r_hip").unwrap_or(0),
+            ],
+            pelvis_unobserved_s: 0.0,
+            pelvis_observed_streak_s: 0.0,
+            root_hold_locked: false,
             hold_targets: [(false, [0.0; 3]), (false, [0.0; 3])],
             arm_obs_masked: false,
             arm_below_shoulder: arm_below_shoulder_params(model),
@@ -319,6 +361,9 @@ impl Estimator {
         self.last_t = None;
         self.frames = 0;
         self.shape_frozen = false;
+        self.pelvis_unobserved_s = 0.0;
+        self.pelvis_observed_streak_s = 0.0;
+        self.root_hold_locked = false;
     }
 
     /// Predict the state at time `t` (seconds) from the last posterior:
@@ -473,6 +518,20 @@ impl Estimator {
             None => 1.0 / 30.0,
         };
         // ---- predict --------------------------------------------------------
+        // Root hold (see the full rationale at the prior-variance block
+        // below): while engaged, the held axes carry no velocity either, so
+        // the prediction itself cannot smuggle pre-drought momentum into
+        // the frozen orientation.
+        static ROOT_HOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let root_hold_enabled = *ROOT_HOLD.get_or_init(|| {
+            std::env::var("VULVATAR_FUSION_ROOT_HOLD")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        });
+        if root_hold_enabled && self.root_hold_locked {
+            self.vel[0] = 0.0; // root pitch
+            self.vel[2] = 0.0; // root roll
+        }
         let prev = self.state.clone();
         self.pred = self.predict(model, obs.t.max(self.last_t.unwrap_or(obs.t)));
         if self.last_t.is_none() {
@@ -508,6 +567,55 @@ impl Estimator {
                 self.hold_targets[k] = (active, sub(pred_fk.t[wj], self.pred.root_t));
             }
         }
+        // ---- root hold -------------------------------------------------------
+        // In the desk envelope the pelvis sits below the desk: no hip
+        // keypoint survives the truncation cull and no dense point reaches
+        // the pelvis capsule, so nothing observes root rotation directly —
+        // yet every upper-body residual writes gradients into the root
+        // columns through the chain Jacobians, and the pelvis orientation
+        // wanders among equal-cost explanations of the visible torso
+        // (live measurement 2026-10-02: spine tilt oscillating 0.8–37.5°,
+        // 50 regime switches / 3 min, camera-verified as poses the subject
+        // was NOT doing). A bench FIRST tried scaling q_root_rot down for
+        // the drought (2026-10-02, 3 desk recordings): no effect — the
+        // temporal prior is orders of magnitude weaker than the data pull,
+        // which is exactly why the tighter-prior idea lost to the
+        // data-path cutoff below. While the drought lasts, root pitch/roll
+        // (rotation-vector params 0 and 2) are LOCKED via the existing
+        // `apply_locks` machinery: no channel may move them, the
+        // orientation holds at the prediction. Yaw (param 1) and root
+        // translation stay free — chair turns keep tracking and the upper
+        // body legitimately transports root position.
+        // `VULVATAR_FUSION_ROOT_HOLD=0` disables (`root_hold_enabled`).
+        {
+            let joint_of = |mp: &ModelPoint| match mp {
+                ModelPoint::Joint(j) => Some(*j),
+                ModelPoint::Site(s) => model.sites.get(*s).map(|s| s.joint),
+                ModelPoint::Attached { joint, .. } => Some(*joint),
+            };
+            let pelvis_joints = self.pelvis_joints;
+            let pelvis_observed = obs.kp2d.iter().any(|k| {
+                matches!(joint_of(&k.point), Some(j) if pelvis_joints.contains(&j))
+            }) || obs.kp3d.iter().any(|k| {
+                matches!(joint_of(&k.point), Some(j) if pelvis_joints.contains(&j))
+            });
+            if pelvis_observed {
+                self.pelvis_unobserved_s = 0.0;
+                self.pelvis_observed_streak_s += dt as f32;
+            } else {
+                self.pelvis_unobserved_s += dt as f32;
+                self.pelvis_observed_streak_s = 0.0;
+            }
+        }
+        // Hysteresis: slow to arm, deliberate to release.
+        let root_hold_engaged = root_hold_enabled
+            && self.last_t.is_some()
+            && if self.root_hold_locked {
+                self.pelvis_observed_streak_s < ROOT_HOLD_RELEASE_S
+            } else {
+                self.pelvis_unobserved_s >= ROOT_HOLD_ENGAGE_S
+            };
+        self.root_hold_locked = root_hold_engaged;
         // Prior variance for this frame: P + Q dt (per parameter class).
         let mut prior_var = vec![0.0; n];
         for k in 0..n {
@@ -632,6 +740,14 @@ impl Estimator {
             });
         let mut cost;
         let start = self.state.clone();
+        // Root-hold lock: frozen rows are restored after the seed contest so
+        // the winner re-accumulate + covariance reflect the unmasked normal
+        // equations at the (held) state.
+        let saved_locks = self.locked_param.clone();
+        if root_hold_engaged {
+            self.locked_param[0] = true; // root rotation-vector x (pitch)
+            self.locked_param[2] = true; // root rotation-vector z (roll)
+        }
         let t_phase = std::time::Instant::now();
         let mut stage1: Option<State> = None;
         if twostage {
@@ -699,6 +815,7 @@ impl Estimator {
             }
         }
         self.timings.seeds_ms = t_seeds.elapsed().as_secs_f64() * 1000.0;
+        self.locked_param = saved_locks;
         let t_reacc = std::time::Instant::now();
         if !best_gnc_final || !seeds.is_empty() {
             // Re-accumulate at the winner so H (covariance) matches it.
@@ -827,6 +944,9 @@ impl Estimator {
         self.last_t = None;
         self.lost_frames = 0;
         self.lost_events += 1;
+        self.pelvis_unobserved_s = 0.0;
+        self.pelvis_observed_streak_s = 0.0;
+        self.root_hold_locked = false;
     }
 
     /// Run the damped Gauss–Newton loop on the current state and leave the

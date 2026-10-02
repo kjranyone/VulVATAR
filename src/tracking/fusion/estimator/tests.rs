@@ -681,3 +681,129 @@ fn junk_cloud_gate_drops_cloud_after_lost_level_sparse_frame() {
     est.update(m, &make_obs(false, 3.0 / 30.0));
     assert!(est.diag.n_cloud > 0, "gate stayed closed on clean frames");
 }
+
+#[test]
+fn root_hold_accumulates_pelvis_drought_and_resets_on_observation() {
+    let h = Humanoid::new();
+    let m = &h.model;
+    let gt = gt_state(&h);
+    let intr = intr();
+    let full = observe(m, &gt, intr, 1.0);
+    let pelvis = [h.j.pelvis, h.j.l_hip, h.j.r_hip];
+    let no_pelvis: Vec<Kp2d> = full
+        .iter()
+        .filter(|k| match k.point {
+            ModelPoint::Joint(j) => !pelvis.contains(&j),
+            ModelPoint::Site(s) => !pelvis.contains(&m.sites[s].joint),
+            _ => true,
+        })
+        .cloned()
+        .collect();
+    assert!(no_pelvis.len() < full.len(), "fixture must drop pelvis sites");
+    let obs = |t: f64, kp: &[Kp2d]| FrameObs {
+        t,
+        intr: Some(intr),
+        kp2d: kp.to_vec(),
+        kp3d: Vec::new(),
+        angles: Vec::new(),
+        ori: Vec::new(),
+        shoulder_yaw: None,
+        torso_hint: None,
+        surface: Vec::new(),
+        surf_allow: Vec::new(),
+    };
+    let mut est = Estimator::new(m, Params::default());
+    est.state.root_t = [0.0, 0.3, 1.5];
+    // Desk envelope: 20 frames with no pelvis observation at all.
+    for i in 0..20 {
+        est.update(m, &obs(i as f64 / 30.0, &no_pelvis));
+    }
+    assert!(
+        est.pelvis_unobserved_s >= 0.3,
+        "drought timer did not engage: {}",
+        est.pelvis_unobserved_s
+    );
+    // One frame with hip keypoints back → the hold releases instantly.
+    est.update(m, &obs(20.0 / 30.0, &full));
+    assert_eq!(est.pelvis_unobserved_s, 0.0);
+}
+
+#[test]
+fn root_hold_freezes_root_pitch_roll_while_pelvis_unobserved() {
+    let h = Humanoid::new();
+    let m = &h.model;
+    let gt = gt_state(&h);
+    let intr = intr();
+    let full = observe(m, &gt, intr, 1.0);
+    let pelvis = [h.j.pelvis, h.j.l_hip, h.j.r_hip];
+    let no_pelvis: Vec<Kp2d> = full
+        .iter()
+        .filter(|k| match k.point {
+            ModelPoint::Joint(j) => !pelvis.contains(&j),
+            ModelPoint::Site(s) => !pelvis.contains(&m.sites[s].joint),
+            _ => true,
+        })
+        .cloned()
+        .collect();
+    let obs = |t: f64, kp: &[Kp2d]| FrameObs {
+        t,
+        intr: Some(intr),
+        kp2d: kp.to_vec(),
+        kp3d: Vec::new(),
+        angles: Vec::new(),
+        ori: Vec::new(),
+        shoulder_yaw: None,
+        torso_hint: None,
+        surface: Vec::new(),
+        surf_allow: Vec::new(),
+    };
+    let mut est = Estimator::new(m, Params::default());
+    est.state.root_t = [0.0, 0.3, 1.5];
+    // Engage the hold: a pelvis-observation drought past 0.3 s.
+    for i in 0..20 {
+        est.update(m, &obs(i as f64 / 30.0, &no_pelvis));
+    }
+    let held = est.state.root_r;
+    // Observations that pull hard (whole skeleton shifted down 40 px in the
+    // image — everything wants to move) must NOT move the root pitch/roll
+    // while the hold is engaged: their normal-equation rows are zeroed and
+    // the held axes carry no velocity, so only cross-terms from residual
+    // yaw motion can appear in their log-space components.
+    let pulled: Vec<Kp2d> = no_pelvis
+        .iter()
+        .map(|k| Kp2d {
+            u: k.u,
+            v: k.v + 40.0,
+            sigma: k.sigma,
+            ..*k
+        })
+        .collect();
+    for i in 20..25 {
+        est.update(m, &obs(i as f64 / 30.0, &pulled));
+    }
+    // `param_difference` against a state holding the captured rotation:
+    // components 0/2 of the log map are the pitch/roll the hold must keep.
+    let d = param_difference(m, &est.state, &{
+        let mut s = est.state.clone();
+        s.root_r = held;
+        s
+    });
+    assert!(
+        d[0].abs() < 2e-3 && d[2].abs() < 2e-3,
+        "root pitch/roll moved while held: {:?}",
+        &d[..3]
+    );
+    // Release needs 0.3 s of CONTINUOUS pelvis observation (hysteresis —
+    // a single noisy hip detection must not flip the freeze); past that
+    // the (pulled... now un-shifted) observations move the root again.
+    for i in 25..36 {
+        est.update(m, &obs(i as f64 / 30.0, &full));
+    }
+    let d = param_difference(m, &est.state, &{
+        let mut s = est.state.clone();
+        s.root_r = held;
+        s
+    });
+    let moved = d[0].abs() > 2e-3 || d[2].abs() > 2e-3;
+    assert!(moved, "hold never released: {:?}", &d[..3]);
+}
