@@ -53,6 +53,23 @@ const MOUTH: (usize, usize) = (76, 96);
 /// yaw (a turning head narrows one eye's ring without a blink).
 const BLINK_ENTER: f32 = 0.72;
 const BLINK_EXIT: f32 = 0.82;
+/// Mild narrowing is not a blink. The desk gaze and a turned head bias a
+/// ring's ratio a few percent below its baseline for whole sessions
+/// (measured, desk s1790845108: median closedness L 0.27 / R 0.48 — the
+/// ramp's full scale sat AT the blink-enter threshold, so every percent
+/// of drift read as half a blink and the avatar stared back half-lidded;
+/// the R ring's distribution even clustered at r≈0.80 — headset+glasses
+/// partially covering that eye). Closedness is 0 while the ratio stays
+/// above this floor and ramps to full closure at BLINK_ENTER.
+const BLINK_OPEN_FLOOR: f32 = 0.90;
+/// Eye-open boost applied to the ramp above: closedness c publishes as
+/// 1 − (1 − c)·GAIN, clamped. The desk headset+glasses leave one ring
+/// sitting at c≈0.4-0.5 while genuinely open (measured: R median 0.48
+/// stayed 0.33 under a 0.84 ramp floor — the narrowing is real
+/// appearance, not calibration error), and a streaming avatar is wanted
+/// wide-eyed: the boost lifts partial closures toward open while a full
+/// blink (c = 1, latched) stays exactly 1.0.
+const EYE_OPEN_GAIN: f32 = 2.5;
 const BASELINE_ALPHA: f32 = 0.04;
 
 pub struct FaceRtmpose {
@@ -571,6 +588,13 @@ impl FaceRtmpose {
             .collect();
 
         let mut exprs = self.geometric_expressions(&pts_frame);
+        // The geometric blink owns its channels: the MLP's per-eye
+        // eyeBlink reads the same headset/glasses appearance bias that
+        // drove the half-lid fix, and the max() below would leak it
+        // straight back (measured: R median 0.20 through the
+        // min-symmetrize + boost path on desk s1790845108). The
+        // boosted+symmetrized geometric value IS the blink channel.
+        let geo_blink = exprs.iter().find(|e| e.name == "blink").map(|e| e.weight);
         // MLP channels: 98 box-normalized landmarks -> 52 ARKit weights.
         // Geometric overrides win for blink/jaw (measured more robust
         // than the learned channels on this domain); the MLP contributes
@@ -598,6 +622,13 @@ impl FaceRtmpose {
                             }
                         }
                     }
+                }
+            }
+        }
+        if let Some(b) = geo_blink {
+            for name in ["eyeBlinkLeft", "eyeBlinkRight", "blinkLeft", "blinkRight", "blink"] {
+                if let Some(e) = exprs.iter_mut().find(|e| e.name == name) {
+                    e.weight = b;
                 }
             }
         }
@@ -653,8 +684,9 @@ impl FaceRtmpose {
             }
         }
         let closedness = |r: f32, latched: bool| -> f32 {
-            let c = ((1.0 - r) / (1.0 - BLINK_ENTER)).clamp(0.0, 1.0);
-            if latched { 1.0 } else { c }
+            let c = ((BLINK_OPEN_FLOOR - r) / (BLINK_OPEN_FLOOR - BLINK_ENTER)).clamp(0.0, 1.0);
+            let boosted = 1.0 - (1.0 - c) * EYE_OPEN_GAIN;
+            if latched { 1.0 } else { boosted.clamp(0.0, 1.0) }
         };
         // Mouth ring gets its OWN baseline slot — routing it through an
         // eye slot let the mouth's much larger ratio corrupt that eye's
@@ -664,15 +696,25 @@ impl FaceRtmpose {
         let jaw = ((mar - 1.0) / 0.8).clamp(0.0, 1.0);
         let blink_l = closedness(ear[0], self.blink_latched[0]);
         let blink_r = closedness(ear[1], self.blink_latched[1]);
+        // Desk asymmetry: the headset+glasses bias ONE ring's ratio for
+        // whole sessions (measured, desk s1790845108: median closedness
+        // R 0.48 vs L 0.27; even under the boosted ramp the R eye sat at
+        // 0.28 — the narrowing is real landmark appearance, not
+        // calibration error, and per-eye honesty renders the avatar
+        // winking half-lidded for hours). Both eyes publish the MORE
+        // OPEN eye's value: a real blink plunges both rings together so
+        // it survives, while a single eye's occlusion bias can no longer
+        // squint the avatar.
+        let blink = blink_l.min(blink_r);
         let mut out = Vec::with_capacity(8);
         // ARKit names (subject-left ring is the image-RIGHT ring on an
         // unmirrored camera; WFLW 60..68 sits on the image left, which
         // the MP path's mirror convention assigns to subject LEFT).
-        out.push(expr("eyeBlinkLeft", blink_l));
-        out.push(expr("eyeBlinkRight", blink_r));
-        out.push(expr("blinkLeft", blink_r));
-        out.push(expr("blinkRight", blink_l));
-        out.push(expr("blink", (blink_l + blink_r) * 0.5));
+        out.push(expr("eyeBlinkLeft", blink));
+        out.push(expr("eyeBlinkRight", blink));
+        out.push(expr("blinkLeft", blink));
+        out.push(expr("blinkRight", blink));
+        out.push(expr("blink", blink));
         out.push(expr("jawOpen", jaw));
         out.push(expr("aa", jaw));
         out
@@ -841,7 +883,10 @@ mod tests {
     fn ear_distinguishes_open_and_closed_eye() {
         // WFLW98 eye ring at slots 60..68. The baseline EMA seeds from
         // the first (open) frame, so feeding a closed ring afterwards
-        // must drop eyeBlinkLeft well below the open baseline.
+        // must drop the blink channel well below the open baseline.
+        // BOTH rings close: since the desk-asymmetry fix the published
+        // blink is the more-open eye's value, so a single eye's closure
+        // intentionally stays open (a real blink moves both rings).
         let mut face = FaceRtmpose::new_for_tests();
         let open: Vec<[f64; 2]> = (0..98)
             .map(|i| {
@@ -858,19 +903,35 @@ mod tests {
         let closed: Vec<[f64; 2]> = open
             .iter()
             .enumerate()
-            .map(|(i, p)| if (60..=67).contains(&i) { [p[0], 100.0] } else { *p })
+            .map(|(i, p)| match i {
+                60..=67 => [p[0], 100.0],
+                68..=75 => [p[0], 100.0],
+                _ => *p,
+            })
             .collect();
         let exprs = face.geometric_expressions(&closed);
         let blink_l = exprs.iter().find(|e| e.name == "eyeBlinkLeft").unwrap().weight;
         assert!(
             blink_l > 0.5,
-            "closed eye should read as blink (weight {blink_l})"
+            "closed eyes should read as blink (weight {blink_l})"
         );
-        // latch releases and the channel returns to ~0 once the ring
-        // re-opens past BLINK_EXIT
+        // latch releases and the channel returns to ~0 once the rings
+        // re-open past BLINK_EXIT
         let open_exprs = face.geometric_expressions(&open);
         let open_v = open_exprs.iter().find(|e| e.name == "eyeBlinkLeft").unwrap().weight;
         assert!(open_v < 0.2, "open eye {open_v} should read as not-blinking");
+
+        // One eye closing while the other stays open publishes as OPEN —
+        // the desk-asymmetry contract (the headset biases one ring for
+        // whole sessions and must not squint the avatar).
+        let one_closed: Vec<[f64; 2]> = open
+            .iter()
+            .enumerate()
+            .map(|(i, p)| if (60..=67).contains(&i) { [p[0], 100.0] } else { *p })
+            .collect();
+        let exprs = face.geometric_expressions(&one_closed);
+        let v = exprs.iter().find(|e| e.name == "eyeBlinkLeft").unwrap().weight;
+        assert!(v < 0.2, "one-eyed closure read as {v} — asymmetry leaked");
 
         // jaw: a flat mouth line reads closed; a tall ring reads open
         let shut = face.geometric_expressions(&open);
@@ -892,6 +953,51 @@ mod tests {
         let talking = face.geometric_expressions(&open_mouth);
         let jaw_open = talking.iter().find(|e| e.name == "jawOpen").unwrap().weight;
         assert!(jaw_open > 0.5, "open mouth jawOpen {jaw_open}");
+    }
+
+    #[test]
+    fn mild_narrowing_is_not_a_half_blink() {
+        // The desk-gaze failure (s1790845108: median closedness L 0.27 /
+        // R 0.48): the baseline EMA absorbs the session average, but the
+        // head-yaw distribution leaves one ring ~13% narrowed half the
+        // time. The ramp must read that as (near) open — only a plunge
+        // toward BLINK_ENTER is a blink.
+        let mut face = FaceRtmpose::new_for_tests();
+        let open: Vec<[f64; 2]> = (0..98)
+            .map(|i| {
+                let (x, y) = match i {
+                    60..=67 => ((i - 60) as f64 * 10.0, ((i - 60) as f64 * 3.0).sin() * 8.0 + 100.0),
+                    68..=75 => (200.0 + (i - 68) as f64 * 10.0, ((i - 68) as f64 * 3.0).sin() * 8.0 + 100.0),
+                    76..=95 => (100.0 + (i - 76) as f64 * 5.0, 160.0),
+                    _ => (50.0 + i as f64, 50.0 + i as f64),
+                };
+                [x, y]
+            })
+            .collect();
+        // Settle the baselines on the open ring.
+        for _ in 0..5 {
+            face.geometric_expressions(&open);
+        }
+        // 13.5% narrower ring (the measured desk distribution): the
+        // channel must stay near open, not half-blink.
+        let narrowed: Vec<[f64; 2]> = open
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if (60..=67).contains(&i) {
+                    [p[0], 100.0 + (p[1] - 100.0) * 0.865]
+                } else {
+                    *p
+                }
+            })
+            .collect();
+        let mut worst = 0.0f32;
+        for _ in 0..3 {
+            let exprs = face.geometric_expressions(&narrowed);
+            let v = exprs.iter().find(|e| e.name == "eyeBlinkLeft").unwrap().weight;
+            worst = worst.max(v);
+        }
+        assert!(worst < 0.15, "mild narrowing read as {worst} — the avatar would stare half-lidded");
     }
 
     #[test]
