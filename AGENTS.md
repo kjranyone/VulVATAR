@@ -287,6 +287,21 @@ will invalidate that cache and trigger a rebuild.
   更新が 30Hz→15Hz になる。顔の表情が受け入れたのと同じ取引。
   **却下された cold stride との違いは均一性**: こちらは常に一定間隔、cold stride は
   ロック状態で間隔が変わる = 信号が変わる瞬間にサンプリング間隔も変わるため悪化した。
+- **held lock のスキップ フレーム再出版 (2026-10-02)**: `EVERY_N=2` の交互サンプリングで、
+  ロックが健全に続いていても**スキップ フレームには手の結果が何も載らない**ため、下流
+  (solve の手の観測・出版 annotation の手ブロック・`hand_crops` debug フラグ) が毎フレーム
+  「観測あり/なし」を交互に受けていた = ユーザー視点の「検出の成功/失敗が毎秒数回」点滅。
+  実測: 手首 data-σ がロック中 0.03↔0.36 の方形波 (s1789349575 で両手 29.8/29.9 反転/s、
+  s1790845108 L 8.2/s — ロック自体は 30-49 サンプル連続で安定)。修正は crops ladder 終了後、
+  `last_hands` が None かつ `prev_hands` が Some (スキップ フレームの一意な状態) のスロットに
+  `prev_hands` を再出版するだけ (顔チェーンの「スキップ フレームは最終結果を再出版」と同じ)。
+  A/B (`diagnostics/fusion/holdrep_{before,after}_*`、4 録画): 反転は全滅 (29.8→0.0、8.2→0.3/s)、
+  フレーム duty は hold 分を実値化 (9575: 0.50→0.99/1.00)、胴 yaw std は 9575 で 4.0→1.6 改善・
+  他 3 録画は ±0.5 以内、`hand crops` と summary の duty は**スキップ フレームを数えるように
+  なったのでサンプル単位の duty とは別物** (A/B 比較はリプレイ後のhands.csv を stride 位相で
+  分割して読むこと)。コスト増は観測付加の +1-4ms (推論回数は不変)。
+  副効果: `VULVATAR_HAND_DEPTH_OBS` の drought blob 割当が hold 中スロットを drought と
+  見誤るバグも消えた (`assign_depth_blobs` は `last_hands` 由来で drought を判定する)。
 - **バッチ推論は却下 (DirectML で逆に激遅、実測)**。hand ONNX の入力はバッチ軸が動的
   (`(batch,3,256,256)`) なので候補をまとめられるはずだったが、ベンチ
   (`hands::batch_bench::hand_batch_is_worth_it`、`--ignored`) の結果は
@@ -436,6 +451,27 @@ will invalidate that cache and trigger a rebuild.
 - アブレーション: `VULVATAR_FUSION_NO_DENSE` (密表面)、`NO_3D`、`NO_SURF` (キーポイント直下深度の sparse 表面項)、`NO_BURNIN`、`NO_CHESTYAW`、`NO_ORI`。
   `VULVATAR_FUSION_OBSDUMP=<frame>` で観測とモデルの対応ダンプ (`999_999` = 最初のフレーム)、`VULVATAR_FUSION_KEEP_CLOUD=1` でオーバーレイに表面点を描く。
   旧ゲート群 (border cull / reach / leg gate / coherence) は `VULVATAR_FUSION_OLDGATES` を付けた時のみ有効。完全な一覧は `docs/tracking-v2-design.md` §7。
+- **Root hold (デスクの「やっていない姿勢」対策, 2026-10-02 既定 ON)**: デスク envelope では腰が切断カリングされ
+  (`provider.rs` の visible-height < 0.65 m cull)、root 回転を直接観測するものが無いのに上半身の残差が chain
+  Jacobian で root 列に勾配を書くため、等価コストの basin 間を骨盤姿勢が回遊する (ライブ実測: spine tilt
+  0.8-37.5° 往復・3分50回のレジーム切替、カメラ画像照合で本人がやっていない姿勢と確認)。
+  対策は `estimator/mod.rs` の root hold: 0.3 s 以上腰観測が無いと root の pitch/roll (回転ベクトルの
+  param 0/2) を `apply_locks` で凍結し、held 軸の速度もゼロにする。yaw (param 1) と root 並進は自由
+  (椅子の回転と上半身由来の移動は追従)。解除は 0.3 s の連続腰観測が必要 (ヒステリシス — 単発の
+  幻覚 hip 検出で freeze が flap すると解除過渡で tilt std が悪化する、第2ラウンドの実測)。
+  `VULVATAR_FUSION_ROOT_HOLD=0` で無効 (診断用 kill switch)。
+  **ベンチ (2026-10-02, `diagnostics/fusion/deskroot_*`, 7録画)**: デスク3録画で root wander 大幅改善
+  (s1790845108: y span 85→45mm・jumps 7→3、s1789543658: root std 36/12/65→**3.7/3.8/3.9mm**・10倍、
+  s1789544694: jmax 32→27mm)、正面 chin で root jumps 28→2・max 118.5→34.8mm、clasp/frontal は不変。
+  validate_gt の summary は ON/OFF 完全一致 (合成ポーズは腰が観測されるため hold 不発)、solve 時間は
+  ラン間非決定性の範囲内。**卻下済みのレバー (コードごと削除、再実験は git history から)**:
+  (a) 胴深度合議 (肩深度平面から外れた腰/膝サンプルの格下げ) — デスクでは腰が cull 済みで発火自体が
+  起きない (frames.csv の dsig_Lhip 観測 0/600)、(b) シード採用の密深度 veto — 等価コスト basin 間で
+  cloud コストが変わらず一度も発火せず、(c) q_root_rot スケーリング版 root hold — 時間事前がデータの
+  引っ張りより桁で弱く無効果。`VULVATAR_FUSION_TWOSTAGE=1` はデスクで更に良い数値 (s1790845108 root
+  x std 32.8mm) だが clasp で root std 14→30mm に悪化 (トランク段が手観測をマスクするため) — 既定 OFF のまま。
+  症状の切分け手順は memory の root-jump-investigation を参照 (debug_avatar.json の秒毎 tilt + debug_camera.bin
+  画像照合が型)。
 - 新しい症状に場当たり的なゲートを足さない。どの残差・事前・σ が誤っているかをベンチで測ってから直す。
 - ライブ: `VULVATAR_AUTOSTART_TRACKING=1` で起動時にカメラ開始 (realsense2.dll を PATH に)。
   `debug_state.json` の `rig` ブロックに quality / 主要ボーン σ・data_sigma / root / `diag`
