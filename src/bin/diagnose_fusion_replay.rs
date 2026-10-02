@@ -1632,10 +1632,6 @@ fn main() -> Result<(), String> {
             infers as f64 / pairs.len() as f64,
         );
         println!(
-            "hand pregate: {} candidates skipped before inference",
-            vulvatar_lib::tracking::fusion::provider::hand_pregate_skips()
-        );
-        println!(
             "hand dedup: {} duplicate windows dropped",
             vulvatar_lib::tracking::fusion::provider::hand_dedup_skips()
         );
